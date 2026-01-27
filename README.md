@@ -10,16 +10,40 @@ A robust, high-performance file system watcher library and command-line tool for
 *   **Robust Process Management:** Uses process groups (`setpgid`/`kill`) to ensure child processes and their subprocesses are properly killed on reload.
 *   **Debouncing:** Batches rapid events to prevent unnecessary restarts.
 *   **Smart Exclusion:** Automatically ignores the output binary (if specified via `-bin`) to prevent infinite loops.
+*   **Content-Based Caching:** Hashes file content to ensure reloads only happen when content *actually* changes (ignoring atomic saves or "Ctrl+S without changes").
 *   **Config File Support:** Can read configuration from `cnotify.conf`.
 *   **Zero Dependencies:** Only requires standard Linux libraries (libc).
 
 ## Building
 
+To build the project (CLI tool, static library, and shared library):
+
 ```bash
 make
 ```
 
-This will produce the library object `build/cnotify.o` and the command-line tool `bin/cnotify`.
+This produces:
+*   `bin/cnotify`: The hot-reload CLI tool.
+*   `lib/libcnotify.a`: Static library.
+*   `lib/libcnotify.so`: Shared library.
+
+To run tests:
+```bash
+make test
+```
+
+## Installation
+
+To install the binary, libraries, and header file to standard system locations (`/usr/local` by default):
+
+```bash
+sudo make install
+```
+
+You can customize the install prefix:
+```bash
+sudo make install PREFIX=/usr
+```
 
 ## Usage (CLI)
 
@@ -56,19 +80,19 @@ verbose=true
 **Hot-reload a Go application:**
 
 ```bash
-./bin/cnotify -path . -build "go build -o app" -bin "./app"
+cnotify -path . -build "go build -o app" -bin "./app"
 ```
 
 **Hot-reload a Python script:**
 
 ```bash
-./bin/cnotify -path src -bin "python3 src/main.py"
+cnotify -path src -bin "python3 src/main.py"
 ```
 
 **Hot-reload a shell script (for testing):**
 
 ```bash
-./bin/cnotify -path . -bin "./myscript.sh"
+cnotify -path . -bin "./myscript.sh"
 ```
 
 ## Usage (Library)
@@ -76,13 +100,14 @@ verbose=true
 To use `cnotify` in your own C programs:
 
 1.  Include `cnotify.h`.
-2.  Link against `cnotify.o`.
+2.  Link against `libcnotify`.
 
 ```c
-#include "cnotify.h"
+#include <cnotify.h>
+#include <stdio.h>
 
 int my_callback(const cnotify_event_t *event, void *user_data) {
-    printf("File changed: %s/%s\n", event->path, event->name);
+    printf("Event: %s (Type: %d)\n", event->name, event->type);
     return 0; // Return 1 to stop the loop
 }
 
@@ -93,4 +118,9 @@ int main() {
     cnotify_destroy(cn);
     return 0;
 }
+```
+
+Compile with:
+```bash
+gcc main.c -o main -lcnotify
 ```
