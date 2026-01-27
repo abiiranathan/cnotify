@@ -116,7 +116,7 @@ static FileHash* hash_map[HASH_MAP_SIZE];
 static unsigned long str_hash(const char* str) {
     unsigned long hash = 5381;
     int c;
-    while ((c = *str++)) hash = ((hash << 5) + hash) + c;
+    while ((c = *str++)) hash = ((hash << 5) + hash) + (unsigned)c;
     return hash;
 }
 
@@ -127,7 +127,7 @@ static unsigned long file_hash(const char* path) {
 
     unsigned long hash = 5381;
     int c;
-    while ((c = fgetc(f)) != EOF) hash = ((hash << 5) + hash) + c;
+    while ((c = fgetc(f)) != EOF) hash = ((hash << 5) + hash) + (unsigned)c;
 
     fclose(f);
     return hash;
@@ -172,6 +172,27 @@ static int map_check_and_update(const char* path) {
     // Not found, insert new
     map_put(path, new_hash);
     return 1;  // Treated as change
+}
+
+static void map_remove(const char* path) {
+    unsigned int idx = str_hash(path) % HASH_MAP_SIZE;
+    FileHash* curr = hash_map[idx];
+    FileHash* prev = NULL;
+
+    while (curr) {
+        if (strcmp(curr->path, path) == 0) {
+            if (prev) {
+                prev->next = curr->next;
+            } else {
+                hash_map[idx] = curr->next;
+            }
+            free(curr->path);
+            free(curr);
+            return;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
 }
 
 // Clean up hash map
@@ -264,8 +285,9 @@ static int on_change(const cnotify_event_t* event, void* user_data) {
             return 0;
         }
     } else if (event->type == CNOTIFY_EVENT_DELETE || event->type == CNOTIFY_EVENT_MOVE) {
-        // Should ideally remove from map, but lazy leaving it is fine for now
-        // Or we could implement map_remove
+        char fullpath[4096];
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", event->path, event->name);
+        map_remove(fullpath);
     }
 
     restart_app();
