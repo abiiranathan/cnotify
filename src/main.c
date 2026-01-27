@@ -163,15 +163,16 @@ static int map_check_and_update(const char* path) {
     while (curr) {
         if (strcmp(curr->path, path) == 0) {
             if (curr->hash == new_hash) return 0;  // No change
+            if (verbose) printf("Changed: hash: %lu -> %lu\n", curr->hash, new_hash);
             curr->hash = new_hash;
             return 1;  // Changed
         }
         curr = curr->next;
     }
 
-    // Not found, insert new
+    // Not found, insert new (don't trigger reload for first-time tracking)
     map_put(path, new_hash);
-    return 1;  // Treated as change
+    return 0;  // Don't reload on first encounter
 }
 
 static void map_remove(const char* path) {
@@ -272,22 +273,28 @@ static void restart_app() {
 
 static int on_change(const cnotify_event_t* event, void* user_data) {
     (void)user_data;
-    if (verbose) printf("Event: %s/%s\n", event->path, event->name);
+    if (verbose) printf("Event: %s/%s (type=%d, is_dir=%d)\n", event->path, event->name, event->type, event->is_dir);
 
-    // Only verify content for MODIFY events on files
-    // Directories don't have content in the same way, and other events (CREATE, DELETE) definitely change state
-    if (event->type == CNOTIFY_EVENT_MODIFY && !event->is_dir) {
-        char fullpath[4096];  // Should be enough, or use malloc
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", event->path, event->name);
+    // Skip directory events
+    if (event->is_dir) {
+        if (verbose) printf("Ignored (directory event): %s/%s\n", event->path, event->name);
+        return 0;
+    }
 
-        if (!map_check_and_update(fullpath)) {
-            if (verbose) printf("Ignored (content unchanged): %s\n", fullpath);
-            return 0;
-        }
-    } else if (event->type == CNOTIFY_EVENT_DELETE || event->type == CNOTIFY_EVENT_MOVE) {
-        char fullpath[4096];
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", event->path, event->name);
+    char fullpath[4096];
+    snprintf(fullpath, sizeof(fullpath), "%s/%s", event->path, event->name);
+
+    // Handle DELETE and MOVE events
+    if (event->type == CNOTIFY_EVENT_DELETE || event->type == CNOTIFY_EVENT_MOVE) {
         map_remove(fullpath);
+        restart_app();
+        return 0;
+    }
+
+    // For MODIFY and CREATE events, check if content actually changed
+    if (!map_check_and_update(fullpath)) {
+        if (verbose) printf("Ignored (content unchanged): %s\n", fullpath);
+        return 0;
     }
 
     restart_app();
