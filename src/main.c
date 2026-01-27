@@ -101,6 +101,93 @@ static const char** split_string(char* str, const char* delim) {
     return result;
 }
 
+// Hash map for file content
+#define HASH_MAP_SIZE 1024
+
+typedef struct FileHash {
+    char* path;
+    unsigned long hash;
+    struct FileHash* next;
+} FileHash;
+
+static FileHash* hash_map[HASH_MAP_SIZE];
+
+// djb2 hash for strings
+static unsigned long str_hash(const char* str) {
+    unsigned long hash = 5381;
+    int c;
+    while ((c = *str++)) hash = ((hash << 5) + hash) + c;
+    return hash;
+}
+
+// Simple hash for file content
+static unsigned long file_hash(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;  // Treat unreadable as 0
+
+    unsigned long hash = 5381;
+    int c;
+    while ((c = fgetc(f)) != EOF) hash = ((hash << 5) + hash) + c;
+
+    fclose(f);
+    return hash;
+}
+
+static void map_put(const char* path, unsigned long hash) {
+    unsigned int idx = str_hash(path) % HASH_MAP_SIZE;
+    FileHash* curr = hash_map[idx];
+
+    // Update existing
+    while (curr) {
+        if (strcmp(curr->path, path) == 0) {
+            curr->hash = hash;
+            return;
+        }
+        curr = curr->next;
+    }
+
+    // Insert new
+    FileHash* node = malloc(sizeof(FileHash));
+    if (!node) return;
+    node->path = strdup(path);
+    node->hash = hash;
+    node->next = hash_map[idx];
+    hash_map[idx] = node;
+}
+
+static int map_check_and_update(const char* path) {
+    unsigned long new_hash = file_hash(path);
+    unsigned int idx = str_hash(path) % HASH_MAP_SIZE;
+    FileHash* curr = hash_map[idx];
+
+    while (curr) {
+        if (strcmp(curr->path, path) == 0) {
+            if (curr->hash == new_hash) return 0;  // No change
+            curr->hash = new_hash;
+            return 1;  // Changed
+        }
+        curr = curr->next;
+    }
+
+    // Not found, insert new
+    map_put(path, new_hash);
+    return 1;  // Treated as change
+}
+
+// Clean up hash map
+static void free_hash_map() {
+    for (int i = 0; i < HASH_MAP_SIZE; i++) {
+        FileHash* curr = hash_map[i];
+        while (curr) {
+            FileHash* next = curr->next;
+            free(curr->path);
+            free(curr);
+            curr = next;
+        }
+        hash_map[i] = NULL;
+    }
+}
+
 static void log_info(const char* msg) { printf("\033[36m[cnotify]\033[0m %s\n", msg); }
 
 static void log_err(const char* msg) { fprintf(stderr, "\033[31m[cnotify] Error:\033[0m %s\n", msg); }
@@ -165,6 +252,22 @@ static void restart_app() {
 static int on_change(const cnotify_event_t* event, void* user_data) {
     (void)user_data;
     if (verbose) printf("Event: %s/%s\n", event->path, event->name);
+
+    // Only verify content for MODIFY events on files
+    // Directories don't have content in the same way, and other events (CREATE, DELETE) definitely change state
+    if (event->type == CNOTIFY_EVENT_MODIFY && !event->is_dir) {
+        char fullpath[4096];  // Should be enough, or use malloc
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", event->path, event->name);
+
+        if (!map_check_and_update(fullpath)) {
+            if (verbose) printf("Ignored (content unchanged): %s\n", fullpath);
+            return 0;
+        }
+    } else if (event->type == CNOTIFY_EVENT_DELETE || event->type == CNOTIFY_EVENT_MOVE) {
+        // Should ideally remove from map, but lazy leaving it is fine for now
+        // Or we could implement map_remove
+    }
+
     restart_app();
     return 0;  // Continue loop
 }
@@ -337,6 +440,7 @@ int main(int argc, char* argv[]) {
     cnotify_destroy(cn);
 
     // Cleanup
+    free_hash_map();
     if (exclude_list) {
         for (int i = 0; exclude_list[i]; i++) {
             free((void*)exclude_list[i]);
