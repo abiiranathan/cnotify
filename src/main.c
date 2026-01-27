@@ -26,6 +26,32 @@ static int verbose = 0;
 static pid_t child_pid = 0;
 
 // Helper to split string by comma
+// Helper to get basename from path
+static const char* get_basename(const char* path) {
+    const char* last_slash = strrchr(path, '/');
+    return last_slash ? last_slash + 1 : path;
+}
+
+// Helper to extract binary name from command string
+static char* extract_binary_name(const char* cmd) {
+    if (!cmd) return NULL;
+
+    char* tmp = strdup(cmd);
+    if (!tmp) return NULL;
+
+    // Get first token (the binary)
+    char* token = strtok(tmp, " ");
+    if (!token) {
+        free(tmp);
+        return NULL;
+    }
+
+    const char* base = get_basename(token);
+    char* ret = strdup(base);
+    free(tmp);
+    return ret;
+}
+
 static const char** split_string(char* str, const char* delim) {
     if (!str) return NULL;
 
@@ -136,9 +162,9 @@ static void restart_app() {
     start_process(run_cmd);
 }
 
-static int on_change(CNotifyEvent* event, void* user_data) {
+static int on_change(const cnotify_event_t* event, void* user_data) {
     (void)user_data;
-    if (verbose) printf("Event: %s/%s\n", event->path, event->filename);
+    if (verbose) printf("Event: %s/%s\n", event->path, event->name);
     restart_app();
     return 0;  // Continue loop
 }
@@ -171,7 +197,62 @@ void print_usage(const char* prog) {
     printf("  -h              Show this help\n");
 }
 
+static void parse_config_file(const char* filename) {
+    FILE* f = fopen(filename, "r");
+    if (!f) return;
+
+    if (verbose) printf("Loading config from %s\n", filename);
+
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        // Trim newline
+        char* p = strchr(line, '\n');
+        if (p) *p = '\0';
+
+        // Skip comments and empty lines
+        if (line[0] == '#' || line[0] == '\0') continue;
+
+        // Parse key=value
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+
+        *eq = '\0';
+        char* key = line;
+        char* val = eq + 1;
+
+        // Trim spaces around key
+        while (isspace(*key)) key++;
+        char* end = key + strlen(key) - 1;
+        while (end > key && isspace(*end)) *end-- = '\0';
+
+        // Trim spaces around val
+        while (isspace(*val)) val++;
+        end = val + strlen(val) - 1;
+        while (end > val && isspace(*end)) *end-- = '\0';
+
+        if (strcmp(key, "build") == 0) {
+            if (!build_cmd) build_cmd = strdup(val);
+        } else if (strcmp(key, "bin") == 0) {
+            if (!run_cmd) run_cmd = strdup(val);
+        } else if (strcmp(key, "path") == 0) {
+            // Only set if still default (checking against "." literal address might fail if compiler merges strings,
+            // but strcmp is safer)
+            if (strcmp(watch_path, ".") == 0) watch_path = strdup(val);
+        } else if (strcmp(key, "exclude") == 0) {
+            // Check if exclude_str is the default literal
+            if (strncmp(exclude_str, ".git", 4) == 0) exclude_str = strdup(val);
+        } else if (strcmp(key, "verbose") == 0) {
+            if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0) verbose = 1;
+        }
+    }
+
+    fclose(f);
+}
+
 int main(int argc, char* argv[]) {
+    // Check for config file first (defaults)
+    parse_config_file("cnotify.conf");
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-build") == 0 && i + 1 < argc) {
             build_cmd = argv[++i];
@@ -211,7 +292,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Init watcher
-    CNotify* cn = cnotify_init();
+    cnotify_t* cn = cnotify_init();
     if (!cn) {
         log_err("Failed to initialize watcher");
         return 1;
@@ -220,8 +301,30 @@ int main(int argc, char* argv[]) {
     exclude_list = split_string(exclude_str, ",");
     if (!exclude_list && exclude_str) {
         log_err("Failed to allocate memory for exclude list");
-        cnotify_free(cn);
+        cnotify_destroy(cn);
         return 1;
+    }
+
+    // Attempt to automatically add the binary name to exclusion list
+    char* binary_name = extract_binary_name(run_cmd);
+    if (binary_name) {
+        if (verbose) printf("Auto-excluding binary: %s\n", binary_name);
+
+        // Count existing exclusions
+        size_t count = 0;
+        if (exclude_list) {
+            while (exclude_list[count]) count++;
+        }
+
+        // Reallocate list to add binary name
+        const char** new_list = realloc((void*)exclude_list, sizeof(char*) * (count + 2));
+        if (new_list) {
+            exclude_list = new_list;
+            exclude_list[count] = binary_name;
+            exclude_list[count + 1] = NULL;
+        } else {
+            free(binary_name);  // Failed to add, but not fatal
+        }
     }
 
     log_info("Watching for changes...");
@@ -231,7 +334,7 @@ int main(int argc, char* argv[]) {
 
     cnotify_start_loop(cn, on_change, NULL);
 
-    cnotify_free(cn);
+    cnotify_destroy(cn);
 
     // Cleanup
     if (exclude_list) {

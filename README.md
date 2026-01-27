@@ -9,6 +9,8 @@ A robust, high-performance file system watcher library and command-line tool for
 *   **Dynamic Handling:** Detects new directories and adds watches to them immediately.
 *   **Robust Process Management:** Uses process groups (`setpgid`/`kill`) to ensure child processes and their subprocesses are properly killed on reload.
 *   **Debouncing:** Batches rapid events to prevent unnecessary restarts.
+*   **Smart Exclusion:** Automatically ignores the output binary (if specified via `-bin`) to prevent infinite loops.
+*   **Config File Support:** Can read configuration from `cnotify.conf`.
 *   **Zero Dependencies:** Only requires standard Linux libraries (libc).
 
 ## Building
@@ -34,6 +36,20 @@ The `cnotify` tool monitors a directory and restarts a command when changes are 
 *   `-build <cmd>`: Optional command to run before starting the application (e.g., `go build`). If the build fails, the app is not restarted.
 *   `-exclude <list>`: Comma-separated list of directories/files to ignore (default: `.git,.idea,.vscode,tmp,vendor,bin`).
 *   `-v`: Verbose output (shows which files changed).
+
+### Configuration File
+
+You can create a `cnotify.conf` file in the current directory to set default options. CLI arguments override these settings.
+
+Example `cnotify.conf`:
+```ini
+# cnotify configuration
+build=go build -o myapp
+bin=./myapp
+path=.
+exclude=.git,node_modules,tmp
+verbose=true
+```
 
 ### Examples
 
@@ -65,16 +81,16 @@ To use `cnotify` in your own C programs:
 ```c
 #include "cnotify.h"
 
-int my_callback(CNotifyEvent *event, void *user_data) {
-    printf("File changed: %s/%s\n", event->path, event->filename);
+int my_callback(const cnotify_event_t *event, void *user_data) {
+    printf("File changed: %s/%s\n", event->path, event->name);
     return 0; // Return 1 to stop the loop
 }
 
 int main() {
-    CNotify *cn = cnotify_init();
+    cnotify_t *cn = cnotify_init();
     cnotify_add_watch(cn, ".", NULL);
     cnotify_start_loop(cn, my_callback, NULL);
-    cnotify_free(cn);
+    cnotify_destroy(cn);
     return 0;
 }
 ```

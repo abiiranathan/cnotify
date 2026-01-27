@@ -1,4 +1,10 @@
-test_sandbox
-build
-bin
-go
+bin/
+build/
+*.o
+*.log
+.DS_Store
+.vscode/
+tmp/
+test_sandbox/
+*.swp
+go/
