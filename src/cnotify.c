@@ -298,8 +298,8 @@ static int add_watch_recursive(cnotify_t* cn, const char* path) {
 static cnotify_event_type_t mask_to_event_type(uint32_t mask) {
     if (mask & IN_MODIFY) return CNOTIFY_EVENT_MODIFY;
     if (mask & IN_CREATE) return CNOTIFY_EVENT_CREATE;
-    if (mask & IN_DELETE) return CNOTIFY_EVENT_DELETE;
-    if (mask & (IN_MOVED_FROM | IN_MOVED_TO)) return CNOTIFY_EVENT_MOVE;
+    if (mask & (IN_DELETE | IN_MOVED_FROM)) return CNOTIFY_EVENT_DELETE;
+    if (mask & IN_MOVED_TO) return CNOTIFY_EVENT_MODIFY;
     if (mask & IN_ATTRIB) return CNOTIFY_EVENT_ATTRIB;
     if (mask & IN_CLOSE_WRITE) return CNOTIFY_EVENT_CLOSE_WRITE;
 
