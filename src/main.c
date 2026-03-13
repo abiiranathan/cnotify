@@ -12,7 +12,8 @@
 #include <unistd.h>
 #include "../include/cnotify.h"
 
-#define MAX_ARGS 64
+#define MAX_ARGS        64
+#define TERM_TIMEOUT_MS 1000  // Wait 1 second before SIGKILL
 
 // Configuration
 static char* build_cmd = NULL;
@@ -215,17 +216,45 @@ static void log_info(const char* msg) { printf("\033[36m[cnotify]\033[0m %s\n", 
 static void log_err(const char* msg) { fprintf(stderr, "\033[31m[cnotify] Error:\033[0m %s\n", msg); }
 
 static void kill_child() {
-    if (child_pid > 0) {
-        if (verbose) printf("Killing process group %d\n", child_pid);
-        // Kill the process group
-        kill(-child_pid, SIGTERM);
+    if (child_pid <= 0) return;
 
-        // Wait a bit, then force kill if necessary?
-        // For speed, we just waitpid.
-        int status;
-        waitpid(child_pid, &status, 0);
-        child_pid = 0;
+    if (verbose) printf("Killing process group %d\n", child_pid);
+
+    // Send SIGTERM to process group
+    kill(-child_pid, SIGTERM);
+
+    // Wait with timeout for graceful shutdown
+    int status;
+    int attempts = 0;
+    const int max_attempts = TERM_TIMEOUT_MS / 100;  // Check every 100ms
+
+    while (attempts < max_attempts) {
+        pid_t result = waitpid(child_pid, &status, WNOHANG);
+
+        if (result == child_pid) {
+            // Process exited
+            if (verbose) printf("Process %d exited gracefully\n", child_pid);
+            child_pid = 0;
+            return;
+        } else if (result == -1) {
+            // Error (process doesn't exist)
+            if (verbose) printf("Process %d already gone\n", child_pid);
+            child_pid = 0;
+            return;
+        }
+
+        // Still running, wait a bit
+        usleep(100000);  // 100ms
+        attempts++;
     }
+
+    // Timeout expired, force kill
+    if (verbose) printf("Process %d didn't exit, sending SIGKILL\n", child_pid);
+    kill(-child_pid, SIGKILL);
+
+    // Final wait (should be immediate after SIGKILL)
+    waitpid(child_pid, &status, 0);
+    child_pid = 0;
 }
 
 static void start_process(const char* cmd) {
