@@ -66,7 +66,7 @@ $(LIB_OUT_DIR):
 clean:
 	rm -rf $(OBJ_DIR) $(BIN_DIR) $(LIB_OUT_DIR)
 
-test: $(TARGET_TEST)
+test: $(TARGET_CLI) $(TARGET_TEST)
 	./$(TARGET_TEST)
 
 install: all

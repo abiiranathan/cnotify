@@ -298,8 +298,8 @@ static int add_watch_recursive(cnotify_t* cn, const char* path) {
 static cnotify_event_type_t mask_to_event_type(uint32_t mask) {
     if (mask & IN_MODIFY) return CNOTIFY_EVENT_MODIFY;
     if (mask & IN_CREATE) return CNOTIFY_EVENT_CREATE;
-    if (mask & (IN_DELETE | IN_MOVED_FROM)) return CNOTIFY_EVENT_DELETE;
-    if (mask & IN_MOVED_TO) return CNOTIFY_EVENT_MODIFY;
+    if (mask & IN_DELETE) return CNOTIFY_EVENT_DELETE;
+    if (mask & (IN_MOVED_FROM | IN_MOVED_TO | IN_MOVE_SELF)) return CNOTIFY_EVENT_MOVE;
     if (mask & IN_ATTRIB) return CNOTIFY_EVENT_ATTRIB;
     if (mask & IN_CLOSE_WRITE) return CNOTIFY_EVENT_CLOSE_WRITE;
 
@@ -309,8 +309,7 @@ static cnotify_event_type_t mask_to_event_type(uint32_t mask) {
 /**
  * Process a single inotify event and invoke callback
  */
-static int handle_event(cnotify_t* cn, struct inotify_event* ie, cnotify_callback_t callback, void* userdata,
-                        int* triggered) {
+static int handle_event(cnotify_t* cn, struct inotify_event* ie, cnotify_callback_t callback, void* userdata) {
     const char* dir_path;
     cnotify_event_t event;
     char* new_path;
@@ -354,9 +353,6 @@ static int handle_event(cnotify_t* cn, struct inotify_event* ie, cnotify_callbac
         hash_remove(cn, ie->wd);
     }
 
-    /* If we already triggered a callback in this batch, don't do it again */
-    if (*triggered) return 0;
-
     /* Fill in event structure */
     memset(&event, 0, sizeof(event));
     event.type = mask_to_event_type(ie->mask);
@@ -366,7 +362,6 @@ static int handle_event(cnotify_t* cn, struct inotify_event* ie, cnotify_callbac
     event.is_dir = !!(ie->mask & IN_ISDIR);
 
     /* Invoke callback */
-    *triggered = 1;
     return callback(&event, userdata);
 }
 
@@ -380,7 +375,6 @@ static int process_events_once(cnotify_t* cn, cnotify_callback_t callback, void*
     char* ptr;
     int processed = 0;
     int ret;
-    int triggered = 0;
 
     len = read(cn->fd, cn->event_buf, cn->event_buf_size);
     if (len < 0) {
@@ -398,7 +392,7 @@ static int process_events_once(cnotify_t* cn, cnotify_callback_t callback, void*
     for (ptr = cn->event_buf; ptr < cn->event_buf + len;) {
         ie = (struct inotify_event*)ptr;
 
-        ret = handle_event(cn, ie, callback, userdata, &triggered);
+        ret = handle_event(cn, ie, callback, userdata);
         if (ret != 0) {
             *stop_flag = 1;
             break;
@@ -409,6 +403,32 @@ static int process_events_once(cnotify_t* cn, cnotify_callback_t callback, void*
     }
 
     return processed;
+}
+
+static int process_events_drain(cnotify_t* cn, cnotify_callback_t callback, void* userdata, int* stop_flag) {
+    int flags;
+    int total_processed = 0;
+
+    flags = fcntl(cn->fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+
+    if (fcntl(cn->fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+
+    while (!*stop_flag) {
+        int ret = process_events_once(cn, callback, userdata, stop_flag);
+        if (ret < 0) {
+            int saved_errno = errno;
+            (void)fcntl(cn->fd, F_SETFL, flags);
+            errno = saved_errno;
+            return -1;
+        }
+
+        if (ret == 0) break;
+        total_processed += ret;
+    }
+
+    if (fcntl(cn->fd, F_SETFL, flags) < 0) return -1;
+    return total_processed;
 }
 
 /* ========================================================================
@@ -523,25 +543,13 @@ int cnotify_get_fd(cnotify_t* cn) { return cn ? cn->fd : -1; }
 
 int cnotify_process_events(cnotify_t* cn, cnotify_callback_t callback, void* userdata) {
     int stop = 0;
-    int flags, ret;
 
     if (!cn || !callback) {
         errno = EINVAL;
         return -1;
     }
 
-    /* Make fd non-blocking temporarily */
-    flags = fcntl(cn->fd, F_GETFL, 0);
-    if (flags < 0) return -1;
-
-    if (fcntl(cn->fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
-
-    ret = process_events_once(cn, callback, userdata, &stop);
-
-    /* Restore blocking mode */
-    fcntl(cn->fd, F_SETFL, flags);
-
-    return ret;
+    return process_events_drain(cn, callback, userdata, &stop);
 }
 
 int cnotify_start_loop(cnotify_t* cn, cnotify_callback_t callback, void* userdata) {
@@ -565,15 +573,19 @@ int cnotify_start_loop(cnotify_t* cn, cnotify_callback_t callback, void* userdat
             return -1;
         }
 
-        /* Apply debounce if configured */
+        /*
+         * Debounce: sleep to let bursty events accumulate in the kernel
+         * buffer, then drain them all at once firing the callback once.
+         * We use select(0,...) as a portable sleep (no fd monitoring).
+         */
         if (cn->debounce_ms > 0) {
             debounce_tv.tv_sec = cn->debounce_ms / 1000;
             debounce_tv.tv_usec = (cn->debounce_ms % 1000) * 1000;
             select(0, NULL, NULL, NULL, &debounce_tv);
         }
 
-        /* Process events */
-        ret = process_events_once(cn, callback, userdata, &stop);
+        /* Process all currently queued events as one cycle. */
+        ret = process_events_drain(cn, callback, userdata, &stop);
         if (ret < 0 && errno != EINTR) return -1;
     }
 

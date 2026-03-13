@@ -3,10 +3,14 @@
 #endif
 
 #include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -121,17 +125,29 @@ static unsigned long str_hash(const char* str) {
     return hash;
 }
 
-// Simple hash for file content
-static unsigned long file_hash(const char* path) {
+// Buffered hash for file content (faster than byte-by-byte fgetc)
+static int file_hash(const char* path, unsigned long* out_hash) {
+    unsigned char buf[8192];
+    size_t n;
     FILE* f = fopen(path, "rb");
-    if (!f) return 0;  // Treat unreadable as 0
-
     unsigned long hash = 5381;
-    int c;
-    while ((c = fgetc(f)) != EOF) hash = ((hash << 5) + hash) + (unsigned)c;
+
+    if (!f) return -1;
+
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            hash = ((hash << 5) + hash) + (unsigned long)buf[i];
+        }
+    }
+
+    if (ferror(f)) {
+        fclose(f);
+        return -1;
+    }
 
     fclose(f);
-    return hash;
+    *out_hash = hash;
+    return 0;
 }
 
 static void map_put(const char* path, unsigned long hash) {
@@ -151,15 +167,24 @@ static void map_put(const char* path, unsigned long hash) {
     FileHash* node = malloc(sizeof(FileHash));
     if (!node) return;
     node->path = strdup(path);
+    if (!node->path) {
+        free(node);
+        return;
+    }
     node->hash = hash;
     node->next = hash_map[idx];
     hash_map[idx] = node;
 }
 
 static int map_check_and_update(const char* path) {
-    unsigned long new_hash = file_hash(path);
+    unsigned long new_hash = 0;
     unsigned int idx = str_hash(path) % HASH_MAP_SIZE;
     FileHash* curr = hash_map[idx];
+
+    if (file_hash(path, &new_hash) < 0) {
+        /* During atomic saves, paths can be transiently unavailable. */
+        return 0;
+    }
 
     while (curr) {
         if (strcmp(curr->path, path) == 0) {
@@ -176,7 +201,7 @@ static int map_check_and_update(const char* path) {
     return 0;  // Don't reload on first encounter
 }
 
-static void map_remove(const char* path) {
+static int map_remove(const char* path) {
     unsigned int idx = str_hash(path) % HASH_MAP_SIZE;
     FileHash* curr = hash_map[idx];
     FileHash* prev = NULL;
@@ -190,11 +215,13 @@ static void map_remove(const char* path) {
             }
             free(curr->path);
             free(curr);
-            return;
+            return 1;
         }
         prev = curr;
         curr = curr->next;
     }
+
+    return 0;
 }
 
 // Clean up hash map
@@ -209,6 +236,53 @@ static void free_hash_map() {
         }
         hash_map[i] = NULL;
     }
+}
+
+// Walk directory tree and insert a content hash for every regular file
+// so that subsequent events can detect real content changes.
+static void preseed_hashes_recurse(const char* dir) {
+    DIR* d = opendir(dir);
+    if (!d) return;
+
+    struct dirent* ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.' && (ent->d_name[1] == '\0' || (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
+            continue;
+
+        // Skip excluded directories
+        if (exclude_list) {
+            int skip = 0;
+            for (int i = 0; exclude_list[i]; i++) {
+                if (strcmp(ent->d_name, exclude_list[i]) == 0) {
+                    skip = 1;
+                    break;
+                }
+            }
+            if (skip) continue;
+        }
+
+        char path[PATH_MAX];
+        int n = snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+        if (n < 0 || (size_t)n >= sizeof(path)) continue;
+
+        struct stat st;
+        if (lstat(path, &st) < 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            preseed_hashes_recurse(path);
+        } else if (S_ISREG(st.st_mode)) {
+            unsigned long h = 0;
+            if (file_hash(path, &h) == 0) {
+                map_put(path, h);
+            }
+        }
+    }
+    closedir(d);
+}
+
+static void preseed_hashes(const char* root) {
+    if (verbose) printf("Pre-seeding file hashes from %s\n", root);
+    preseed_hashes_recurse(root);
 }
 
 static void log_info(const char* msg) { printf("\033[36m[cnotify]\033[0m %s\n", msg); }
@@ -311,12 +385,30 @@ static int on_change(const cnotify_event_t* event, void* user_data) {
     }
 
     char fullpath[4096];
-    snprintf(fullpath, sizeof(fullpath), "%s/%s", event->path, event->name);
+    int n = snprintf(fullpath, sizeof(fullpath), "%s/%s", event->path, event->name);
+    if (n < 0 || (size_t)n >= sizeof(fullpath)) {
+        if (verbose) printf("Ignored (path too long): %s/%s\n", event->path, event->name);
+        return 0;
+    }
 
     // Handle DELETE and MOVE events
-    if (event->type == CNOTIFY_EVENT_DELETE || event->type == CNOTIFY_EVENT_MOVE) {
-        map_remove(fullpath);
-        restart_app();
+    if (event->type == CNOTIFY_EVENT_DELETE) {
+        if (map_remove(fullpath)) restart_app();
+        return 0;
+    }
+
+    if (event->type == CNOTIFY_EVENT_MOVE) {
+        /*
+         * Atomic-save workflows rename temp files over targets.
+         * If the file still exists at this path, check content hash.
+         * If it's gone (temp file renamed away), just clean up tracking
+         * without restarting — the MOVED_TO for the destination handles it.
+         */
+        if (access(fullpath, F_OK) == 0) {
+            if (map_check_and_update(fullpath)) restart_app();
+        } else {
+            map_remove(fullpath);
+        }
         return 0;
     }
 
@@ -492,6 +584,10 @@ int main(int argc, char* argv[]) {
     if (cnotify_add_watch(cn, watch_path, exclude_list) < 0) {
         log_err("Failed to add watch");
     }
+
+    // Pre-seed the hash map with all existing files so that the first
+    // modification of any tracked file is detected as a real content change.
+    preseed_hashes(watch_path);
 
     cnotify_start_loop(cn, on_change, NULL);
 

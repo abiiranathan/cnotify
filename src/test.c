@@ -316,6 +316,115 @@ static int test_remove_watch(void) {
     return 0;
 }
 
+static int count_lines(const char* path) {
+    FILE* f;
+    int lines = 0;
+    int c;
+
+    f = fopen(path, "r");
+    if (!f) return -1;
+
+    while ((c = fgetc(f)) != EOF) {
+        if (c == '\n') lines++;
+    }
+
+    fclose(f);
+    return lines;
+}
+
+/* Test 11: CLI integration - unchanged atomic save should not reload */
+static int test_cli_unchanged_atomic_save(void) {
+    char runner_path[256];
+    char runlog_path[256];
+    char watched_path[256];
+    char tmp_path[256];
+    FILE* f;
+    pid_t pid;
+    int status;
+    int lines_after_start;
+    int lines_after_unchanged;
+    int lines_after_change;
+
+    TEST("CLI unchanged atomic save integration");
+
+    if (setup_test_dir() < 0) FAIL("setup failed");
+
+    snprintf(runner_path, sizeof(runner_path), "%s/runner.sh", TEST_DIR);
+    snprintf(runlog_path, sizeof(runlog_path), "%s/run.log", TEST_DIR);
+    snprintf(watched_path, sizeof(watched_path), "%s/watched.txt", TEST_DIR);
+    snprintf(tmp_path, sizeof(tmp_path), "%s/watched.tmp", TEST_DIR);
+
+    f = fopen(runner_path, "w");
+    if (!f) FAIL("failed to create runner script");
+    fprintf(f, "#!/bin/sh\necho run >> \"$1\"\nsleep 60\n");
+    fclose(f);
+    chmod(runner_path, 0755);
+
+    f = fopen(watched_path, "w");
+    if (!f) FAIL("failed to create watched file");
+    fprintf(f, "hello\n");
+    fclose(f);
+
+    pid = fork();
+    if (pid < 0) FAIL("fork failed");
+
+    if (pid == 0) {
+        execl("./bin/cnotify", "./bin/cnotify", "-path", TEST_DIR, "-exclude",
+              ".git,.idea,.vscode,tmp,vendor,bin,run.log,runner.sh", "-bin",
+              "sh /tmp/cnotify_test/runner.sh /tmp/cnotify_test/run.log", (char*)NULL);
+        _exit(127);
+    }
+
+    usleep(900000);
+
+    lines_after_start = count_lines(runlog_path);
+    if (lines_after_start < 1) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        FAIL("initial process did not start");
+    }
+
+    /* Simulate atomic save with same content: write temp then rename over target. */
+    f = fopen(tmp_path, "w");
+    if (!f) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        FAIL("failed to create temp file");
+    }
+    fprintf(f, "hello\n");
+    fclose(f);
+    if (rename(tmp_path, watched_path) < 0) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        FAIL("rename failed");
+    }
+
+    usleep(900000);
+    lines_after_unchanged = count_lines(runlog_path);
+
+    /* Real content change should trigger one restart. */
+    f = fopen(watched_path, "w");
+    if (!f) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        FAIL("failed to modify watched file");
+    }
+    fprintf(f, "hello changed\n");
+    fclose(f);
+
+    usleep(1200000);
+    lines_after_change = count_lines(runlog_path);
+
+    kill(pid, SIGTERM);
+    waitpid(pid, &status, 0);
+
+    if (lines_after_unchanged != lines_after_start) FAIL("unchanged atomic save caused restart");
+    if (lines_after_change <= lines_after_unchanged) FAIL("real content change did not restart");
+
+    PASS();
+    return 0;
+}
+
 int main(void) {
     printf("\n=== cnotify Test Suite ===\n\n");
 
@@ -329,6 +438,7 @@ int main(void) {
     test_event_detection();
     test_null_params();
     test_remove_watch();
+    test_cli_unchanged_atomic_save();
 
     cleanup_test_dir();
 
