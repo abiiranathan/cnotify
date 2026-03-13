@@ -380,14 +380,12 @@ static int on_change(const cnotify_event_t* event, void* user_data) {
 
     // Skip directory events
     if (event->is_dir) {
-        if (verbose) printf("Ignored (directory event): %s/%s\n", event->path, event->name);
         return 0;
     }
 
     char fullpath[4096];
     int n = snprintf(fullpath, sizeof(fullpath), "%s/%s", event->path, event->name);
     if (n < 0 || (size_t)n >= sizeof(fullpath)) {
-        if (verbose) printf("Ignored (path too long): %s/%s\n", event->path, event->name);
         return 0;
     }
 
@@ -414,7 +412,6 @@ static int on_change(const cnotify_event_t* event, void* user_data) {
 
     // For MODIFY and CREATE events, check if content actually changed
     if (!map_check_and_update(fullpath)) {
-        if (verbose) printf("Ignored (content unchanged): %s\n", fullpath);
         return 0;
     }
 
