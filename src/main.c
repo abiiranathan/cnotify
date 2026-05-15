@@ -10,41 +10,52 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>   /* for select() used as portable sleep */
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include "../include/cnotify.h"
 
-#define MAX_ARGS        64
-#define TERM_TIMEOUT_MS 1000  // Wait 1 second before SIGKILL
+#define MAX_ARGS             64
+#define TERM_TIMEOUT_MS      1000  /* Wait 1 second before SIGKILL */
+#define DEFAULT_PRE_GRACE_MS 150   /* Head-start for pre-cmd before main binary */
 
-// Configuration
-static char* build_cmd = NULL;
-static char* run_cmd = NULL;  // The binary to run
-static char* watch_path = ".";
-static char* exclude_str = ".git,.idea,.vscode,tmp,vendor,bin";
+/* ========================================================================
+ * Configuration (populated from cnotify.conf then CLI flags)
+ * ======================================================================== */
+
+static char*        build_cmd    = NULL;
+static char*        pre_cmd      = NULL;  /* Background command, e.g. tailwindcss --watch */
+static char*        run_cmd      = NULL;  /* Primary binary/script to run */
+static char*        watch_path   = ".";
+static char*        exclude_str  = ".git,.idea,.vscode,tmp,vendor,bin,node_modules,dist";
 static const char** exclude_list = NULL;
-static int verbose = 0;
+static int          verbose      = 0;
+static unsigned int pre_grace_ms = DEFAULT_PRE_GRACE_MS;
 
-// State
-static pid_t child_pid = 0;
+/* ========================================================================
+ * Process state
+ * ======================================================================== */
 
-// Helper to split string by comma
-// Helper to get basename from path
+static pid_t pre_pid = 0;  /* PID of the pre-command process group leader */
+static pid_t run_pid = 0;  /* PID of the main binary process group leader */
+
+/* ========================================================================
+ * String utilities
+ * ======================================================================== */
+
 static const char* get_basename(const char* path) {
     const char* last_slash = strrchr(path, '/');
     return last_slash ? last_slash + 1 : path;
 }
 
-// Helper to extract binary name from command string
 static char* extract_binary_name(const char* cmd) {
     if (!cmd) return NULL;
 
     char* tmp = strdup(cmd);
     if (!tmp) return NULL;
 
-    // Get first token (the binary)
     char* token = strtok(tmp, " ");
     if (!token) {
         free(tmp);
@@ -60,6 +71,7 @@ static char* extract_binary_name(const char* cmd) {
 static const char** split_string(char* str, const char* delim) {
     if (!str) return NULL;
 
+    /* First pass: count tokens */
     size_t count = 0;
     char* tmp = strdup(str);
     if (!tmp) return NULL;
@@ -74,6 +86,7 @@ static const char** split_string(char* str, const char* delim) {
     const char** result = malloc(sizeof(char*) * (count + 1));
     if (!result) return NULL;
 
+    /* Second pass: fill tokens */
     tmp = strdup(str);
     if (!tmp) {
         free(result);
@@ -81,19 +94,16 @@ static const char** split_string(char* str, const char* delim) {
     }
 
     token = strtok(tmp, delim);
-    int i = 0;
+    size_t i = 0;
     while (token) {
-        // Trim spaces
-        while (isspace(*token)) token++;
+        /* Trim leading whitespace */
+        while (isspace((unsigned char)*token)) token++;
         char* end = token + strlen(token) - 1;
-        while (end > token && isspace(*end)) *end-- = '\0';
+        while (end > token && isspace((unsigned char)*end)) *end-- = '\0';
 
         char* dup = strdup(token);
         if (!dup) {
-            // Allocation failed, cleanup everything
-            for (int k = 0; k < i; k++) {
-                free((void*)result[k]);
-            }
+            for (size_t k = 0; k < i; k++) free((void*)result[k]);
             free(result);
             free(tmp);
             return NULL;
@@ -106,235 +116,87 @@ static const char** split_string(char* str, const char* delim) {
     return result;
 }
 
-// Hash map for file content
-#define HASH_MAP_SIZE 1024
-
-typedef struct FileHash {
-    char* path;
-    unsigned long hash;
-    struct FileHash* next;
-} FileHash;
-
-static FileHash* hash_map[HASH_MAP_SIZE];
-
-// djb2 hash for strings
-static unsigned long str_hash(const char* str) {
-    unsigned long hash = 5381;
-    int c;
-    while ((c = *str++)) hash = ((hash << 5) + hash) + (unsigned)c;
-    return hash;
-}
-
-// Buffered hash for file content (faster than byte-by-byte fgetc)
-static int file_hash(const char* path, unsigned long* out_hash) {
-    unsigned char buf[8192];
-    size_t n;
-    FILE* f = fopen(path, "rb");
-    unsigned long hash = 5381;
-
-    if (!f) return -1;
-
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-        for (size_t i = 0; i < n; i++) {
-            hash = ((hash << 5) + hash) + (unsigned long)buf[i];
-        }
-    }
-
-    if (ferror(f)) {
-        fclose(f);
-        return -1;
-    }
-
-    fclose(f);
-    *out_hash = hash;
-    return 0;
-}
-
-static void map_put(const char* path, unsigned long hash) {
-    unsigned int idx = str_hash(path) % HASH_MAP_SIZE;
-    FileHash* curr = hash_map[idx];
-
-    // Update existing
-    while (curr) {
-        if (strcmp(curr->path, path) == 0) {
-            curr->hash = hash;
-            return;
-        }
-        curr = curr->next;
-    }
-
-    // Insert new
-    FileHash* node = malloc(sizeof(FileHash));
-    if (!node) return;
-    node->path = strdup(path);
-    if (!node->path) {
-        free(node);
-        return;
-    }
-    node->hash = hash;
-    node->next = hash_map[idx];
-    hash_map[idx] = node;
-}
-
-static int map_check_and_update(const char* path) {
-    unsigned long new_hash = 0;
-    unsigned int idx = str_hash(path) % HASH_MAP_SIZE;
-    FileHash* curr = hash_map[idx];
-
-    if (file_hash(path, &new_hash) < 0) {
-        /* During atomic saves, paths can be transiently unavailable. */
-        return 0;
-    }
-
-    while (curr) {
-        if (strcmp(curr->path, path) == 0) {
-            if (curr->hash == new_hash) return 0;  // No change
-            if (verbose) printf("Changed: hash: %lu -> %lu\n", curr->hash, new_hash);
-            curr->hash = new_hash;
-            return 1;  // Changed
-        }
-        curr = curr->next;
-    }
-
-    // Not found, insert new (don't trigger reload for first-time tracking)
-    map_put(path, new_hash);
-    return 0;  // Don't reload on first encounter
-}
-
-static int map_remove(const char* path) {
-    unsigned int idx = str_hash(path) % HASH_MAP_SIZE;
-    FileHash* curr = hash_map[idx];
-    FileHash* prev = NULL;
-
-    while (curr) {
-        if (strcmp(curr->path, path) == 0) {
-            if (prev) {
-                prev->next = curr->next;
-            } else {
-                hash_map[idx] = curr->next;
-            }
-            free(curr->path);
-            free(curr);
-            return 1;
-        }
-        prev = curr;
-        curr = curr->next;
-    }
-
-    return 0;
-}
-
-// Clean up hash map
-static void free_hash_map() {
-    for (int i = 0; i < HASH_MAP_SIZE; i++) {
-        FileHash* curr = hash_map[i];
-        while (curr) {
-            FileHash* next = curr->next;
-            free(curr->path);
-            free(curr);
-            curr = next;
-        }
-        hash_map[i] = NULL;
-    }
-}
-
-// Walk directory tree and insert a content hash for every regular file
-// so that subsequent events can detect real content changes.
-static void preseed_hashes_recurse(const char* dir) {
-    DIR* d = opendir(dir);
-    if (!d) return;
-
-    struct dirent* ent;
-    while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.' && (ent->d_name[1] == '\0' || (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
-            continue;
-
-        // Skip excluded directories
-        if (exclude_list) {
-            int skip = 0;
-            for (int i = 0; exclude_list[i]; i++) {
-                if (strcmp(ent->d_name, exclude_list[i]) == 0) {
-                    skip = 1;
-                    break;
-                }
-            }
-            if (skip) continue;
-        }
-
-        char path[PATH_MAX];
-        int n = snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
-        if (n < 0 || (size_t)n >= sizeof(path)) continue;
-
-        struct stat st;
-        if (lstat(path, &st) < 0) continue;
-
-        if (S_ISDIR(st.st_mode)) {
-            preseed_hashes_recurse(path);
-        } else if (S_ISREG(st.st_mode)) {
-            unsigned long h = 0;
-            if (file_hash(path, &h) == 0) {
-                map_put(path, h);
-            }
-        }
-    }
-    closedir(d);
-}
-
-static void preseed_hashes(const char* root) {
-    if (verbose) printf("Pre-seeding file hashes from %s\n", root);
-    preseed_hashes_recurse(root);
-}
+/* ========================================================================
+ * Logging
+ * ======================================================================== */
 
 static void log_info(const char* msg) { printf("\033[36m[cnotify]\033[0m %s\n", msg); }
+static void log_err(const char* msg)  { fprintf(stderr, "\033[31m[cnotify] Error:\033[0m %s\n", msg); }
 
-static void log_err(const char* msg) { fprintf(stderr, "\033[31m[cnotify] Error:\033[0m %s\n", msg); }
+/* ========================================================================
+ * Process management
+ * ======================================================================== */
 
-static void kill_child() {
-    if (child_pid <= 0) return;
+/**
+ * Kill the process group rooted at *pid_ptr and reap all its members.
+ *
+ * Because we launch commands via `/bin/sh -c`, the shell spawns the real
+ * binary as a grandchild.  Both shell and grandchild share a process group
+ * whose ID equals the shell's PID (set via setpgid(0,0) in the child).
+ * Using waitpid(-pgid, ...) harvests every process in that group, preventing
+ * zombie grandchildren.
+ */
+static void kill_process(pid_t* pid_ptr) {
+    pid_t pgid = *pid_ptr;
+    if (pgid <= 0) return;
 
-    if (verbose) printf("Killing process group %d\n", child_pid);
+    if (verbose) printf("Killing process group %d\n", (int)pgid);
+    kill(-pgid, SIGTERM);
 
-    // Send SIGTERM to process group
-    kill(-child_pid, SIGTERM);
-
-    // Wait with timeout for graceful shutdown
     int status;
-    int attempts = 0;
-    const int max_attempts = TERM_TIMEOUT_MS / 100;  // Check every 100ms
+    int attempts       = 0;
+    const int max_att  = TERM_TIMEOUT_MS / 100;
 
-    while (attempts < max_attempts) {
-        pid_t result = waitpid(child_pid, &status, WNOHANG);
-
-        if (result == child_pid) {
-            // Process exited
-            if (verbose) printf("Process %d exited gracefully\n", child_pid);
-            child_pid = 0;
-            return;
-        } else if (result == -1) {
-            // Error (process doesn't exist)
-            if (verbose) printf("Process %d already gone\n", child_pid);
-            child_pid = 0;
-            return;
+    while (attempts < max_att) {
+        /*
+         * Drain the whole process group: loop while waitpid returns children.
+         * Stop when ECHILD (no more members) or no child exited yet (result==0).
+         */
+        pid_t result = waitpid(-pgid, &status, WNOHANG);
+        if (result > 0) {
+            /* A member exited — keep draining without sleeping. */
+            continue;
         }
-
-        // Still running, wait a bit
-        usleep(100000);  // 100ms
+        if (result == -1) {
+            if (errno == EINTR)  continue;
+            if (errno == ECHILD) {
+                /* All members gone. */
+                if (verbose) printf("Process group %d fully exited\n", (int)pgid);
+                *pid_ptr = 0;
+                return;
+            }
+        }
+        /* result == 0: group still running, wait and retry. */
+        usleep(100000);
         attempts++;
     }
 
-    // Timeout expired, force kill
-    if (verbose) printf("Process %d didn't exit, sending SIGKILL\n", child_pid);
-    kill(-child_pid, SIGKILL);
+    if (verbose) printf("Process group %d didn't exit, sending SIGKILL\n", (int)pgid);
+    kill(-pgid, SIGKILL);
 
-    // Final wait (should be immediate after SIGKILL)
-    waitpid(child_pid, &status, 0);
-    child_pid = 0;
+    /* Drain any remaining zombies after SIGKILL. */
+    while (waitpid(-pgid, &status, WNOHANG) > 0);
+
+    *pid_ptr = 0;
 }
 
-static void start_process(const char* cmd) {
+static void kill_all_children(void) {
+    /*
+     * Kill pre_cmd first so it does not race with the dying run_cmd.
+     * For a watcher like tailwindcss this order does not matter much,
+     * but it mirrors the startup order and is easier to reason about.
+     */
+    kill_process(&pre_pid);
+    kill_process(&run_pid);
+}
+
+/**
+ * Fork and exec cmd via /bin/sh -c in a new process group.
+ * The new PGID equals the child's PID, stored in *pid_out.
+ */
+static void start_process(const char* cmd, pid_t* pid_out) {
     if (!cmd) return;
 
-    // Use sh -c to execute command so arguments are handled
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
@@ -342,24 +204,56 @@ static void start_process(const char* cmd) {
     }
 
     if (pid == 0) {
-        // Child
-        // Create new process group so we can kill it and its children
+        /* Child: new process group so kill(-pgid) reaches all descendants. */
         setpgid(0, 0);
-
         char* args[] = {"/bin/sh", "-c", (char*)cmd, NULL};
         execv(args[0], args);
         perror("execv");
-        exit(1);
-    } else {
-        // Parent
-        child_pid = pid;
-        if (verbose) printf("Started process %d: %s\n", pid, cmd);
+        _exit(1);
     }
+
+    *pid_out = pid;
+    if (verbose) printf("Started process %d: %s\n", (int)pid, cmd);
 }
 
-static void restart_app() {
+/**
+ * Sleep for ms milliseconds using select(2) as a portable, signal-safe
+ * alternative to usleep/nanosleep that does not interact with SIGALRM.
+ */
+static void sleep_ms(unsigned int ms) {
+    if (ms == 0) return;
+    struct timeval tv = {
+        .tv_sec  = (time_t)(ms / 1000),
+        .tv_usec = (suseconds_t)((ms % 1000) * 1000),
+    };
+    select(0, NULL, NULL, NULL, &tv);
+}
+
+/**
+ * Launch the pre-command (if configured) followed by the main binary.
+ *
+ * pre_cmd is a long-lived background process (e.g. `tailwindcss --watch`).
+ * We give it a grace period — DEFAULT_PRE_GRACE_MS by default, overridden
+ * with -pre-grace — before starting run_cmd so it can write its initial
+ * output (CSS bundle, generated files, etc.) before the server starts.
+ */
+static void launch_all(void) {
+    if (pre_cmd) {
+        log_info("Starting pre-command...");
+        start_process(pre_cmd, &pre_pid);
+        if (pre_grace_ms > 0) {
+            if (verbose)
+                printf("Waiting %ums for pre-command to initialise\n", pre_grace_ms);
+            sleep_ms(pre_grace_ms);
+        }
+    }
+    log_info("Starting app...");
+    start_process(run_cmd, &run_pid);
+}
+
+static void restart_app(void) {
     log_info("Change detected. Reloading...");
-    kill_child();
+    kill_all_children();
 
     if (build_cmd) {
         log_info("Building...");
@@ -370,142 +264,142 @@ static void restart_app() {
         }
     }
 
-    log_info("Restarting app...");
-    start_process(run_cmd);
+    launch_all();
 }
 
+/* ========================================================================
+ * inotify event callback
+ * ======================================================================== */
+
 static int on_change(const cnotify_event_t* event, void* user_data) {
-    (void)user_data;
-    if (verbose) printf("Event: %s/%s (type=%d, is_dir=%d)\n", event->path, event->name, event->type, event->is_dir);
+    cnotify_t* cn = (cnotify_t*)user_data;
 
-    // Skip directory events
-    if (event->is_dir) {
-        return 0;
-    }
+    if (event->is_dir) return 0;
 
-    char fullpath[4096];
+    char fullpath[PATH_MAX];
     int n = snprintf(fullpath, sizeof(fullpath), "%s/%s", event->path, event->name);
-    if (n < 0 || (size_t)n >= sizeof(fullpath)) {
-        return 0;
-    }
+    if (n < 0 || (size_t)n >= sizeof(fullpath)) return 0;
 
-    // Handle DELETE and MOVE events
     if (event->type == CNOTIFY_EVENT_DELETE) {
-        if (map_remove(fullpath)) restart_app();
-        return 0;
-    }
-
-    if (event->type == CNOTIFY_EVENT_MOVE) {
-        /*
-         * Atomic-save workflows rename temp files over targets.
-         * If the file still exists at this path, check content hash.
-         * If it's gone (temp file renamed away), just clean up tracking
-         * without restarting — the MOVED_TO for the destination handles it.
-         */
-        if (access(fullpath, F_OK) == 0) {
-            if (map_check_and_update(fullpath)) restart_app();
-        } else {
-            map_remove(fullpath);
+        if (cnotify_file_remove(cn, fullpath)) {
+            restart_app();
         }
         return 0;
     }
 
-    // For MODIFY and CREATE events, check if content actually changed
-    if (!map_check_and_update(fullpath)) {
+    if (event->type == CNOTIFY_EVENT_MOVE) {
+        if (access(fullpath, F_OK) == 0) {
+            if (cnotify_file_changed(cn, fullpath)) {
+                restart_app();
+            }
+        } else {
+            cnotify_file_remove(cn, fullpath);
+        }
         return 0;
     }
 
-    restart_app();
-    return 0;  // Continue loop
+    if (cnotify_file_changed(cn, fullpath)) {
+        restart_app();
+    }
+    return 0;
 }
+
+/* ========================================================================
+ * Signal handling
+ * ======================================================================== */
 
 static void handle_sigint(int sig) {
     (void)sig;
     printf("\n");
     log_info("Stopping...");
-    kill_child();
+    kill_all_children();
 
-    // Cleanup exclude list memory
     if (exclude_list) {
-        for (int i = 0; exclude_list[i]; i++) {
-            free((void*)exclude_list[i]);
-        }
+        for (int i = 0; exclude_list[i]; i++) free((void*)exclude_list[i]);
         free(exclude_list);
     }
 
     exit(0);
 }
 
-void print_usage(const char* prog) {
+/* ========================================================================
+ * Configuration: usage, config file, CLI
+ * ======================================================================== */
+
+static void print_usage(const char* prog) {
     printf("Usage: %s [options]\n", prog);
     printf("Options:\n");
-    printf("  -build <cmd>    Command to build the project (optional)\n");
-    printf("  -bin <cmd>      Command to run the binary/script (required)\n");
-    printf("  -path <dir>     Directory to watch (default: .)\n");
-    printf("  -exclude <list> Comma separated list of directories to exclude (default: .git,.idea,...)\n");
-    printf("  -v              Verbose output\n");
-    printf("  -h              Show this help\n");
+    printf("  -build <cmd>      Command to build the project (optional)\n");
+    printf("  -pre <cmd>        Command to run before the binary (e.g. tailwindcss --watch)\n");
+    printf("  -pre-grace <ms>   Grace period after pre-cmd before starting -bin (default: %u)\n",
+           DEFAULT_PRE_GRACE_MS);
+    printf("  -bin <cmd>        Command to run the binary/script (required)\n");
+    printf("  -path <dir>       Directory to watch (default: .)\n");
+    printf("  -exclude <list>   Comma-separated directories to exclude\n");
+    printf("                    (default: .git,.idea,.vscode,tmp,vendor,bin)\n");
+    printf("  -v                Verbose output\n");
+    printf("  -h                Show this help\n");
 }
 
 static void parse_config_file(const char* filename) {
     FILE* f = fopen(filename, "r");
     if (!f) return;
-
     if (verbose) printf("Loading config from %s\n", filename);
 
     char line[1024];
     while (fgets(line, sizeof(line), f)) {
-        // Trim newline
         char* p = strchr(line, '\n');
         if (p) *p = '\0';
-
-        // Skip comments and empty lines
         if (line[0] == '#' || line[0] == '\0') continue;
 
-        // Parse key=value
         char* eq = strchr(line, '=');
         if (!eq) continue;
-
         *eq = '\0';
+
         char* key = line;
         char* val = eq + 1;
 
-        // Trim spaces around key
-        while (isspace(*key)) key++;
+        while (isspace((unsigned char)*key)) key++;
         char* end = key + strlen(key) - 1;
-        while (end > key && isspace(*end)) *end-- = '\0';
+        while (end > key && isspace((unsigned char)*end)) *end-- = '\0';
 
-        // Trim spaces around val
-        while (isspace(*val)) val++;
+        while (isspace((unsigned char)*val)) val++;
         end = val + strlen(val) - 1;
-        while (end > val && isspace(*end)) *end-- = '\0';
+        while (end > val && isspace((unsigned char)*end)) *end-- = '\0';
 
         if (strcmp(key, "build") == 0) {
-            if (!build_cmd) build_cmd = strdup(val);
+            if (!build_cmd)                         build_cmd    = strdup(val);
+        } else if (strcmp(key, "pre") == 0) {
+            if (!pre_cmd)                           pre_cmd      = strdup(val);
+        } else if (strcmp(key, "pre_grace") == 0) {
+            pre_grace_ms = (unsigned int)atoi(val);
         } else if (strcmp(key, "bin") == 0) {
-            if (!run_cmd) run_cmd = strdup(val);
+            if (!run_cmd)                           run_cmd      = strdup(val);
         } else if (strcmp(key, "path") == 0) {
-            // Only set if still default (checking against "." literal address might fail if compiler merges strings,
-            // but strcmp is safer)
-            if (strcmp(watch_path, ".") == 0) watch_path = strdup(val);
+            if (strcmp(watch_path, ".") == 0)       watch_path   = strdup(val);
         } else if (strcmp(key, "exclude") == 0) {
-            // Check if exclude_str is the default literal
             if (strncmp(exclude_str, ".git", 4) == 0) exclude_str = strdup(val);
         } else if (strcmp(key, "verbose") == 0) {
             if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0) verbose = 1;
         }
     }
-
     fclose(f);
 }
 
+/* ========================================================================
+ * Entry point
+ * ======================================================================== */
+
 int main(int argc, char* argv[]) {
-    // Check for config file first (defaults)
     parse_config_file("cnotify.conf");
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-build") == 0 && i + 1 < argc) {
             build_cmd = argv[++i];
+        } else if (strcmp(argv[i], "-pre") == 0 && i + 1 < argc) {
+            pre_cmd = argv[++i];
+        } else if (strcmp(argv[i], "-pre-grace") == 0 && i + 1 < argc) {
+            pre_grace_ms = (unsigned int)atoi(argv[++i]);
         } else if (strcmp(argv[i], "-bin") == 0 && i + 1 < argc) {
             run_cmd = argv[++i];
         } else if (strcmp(argv[i], "-path") == 0 && i + 1 < argc) {
@@ -526,25 +420,24 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    signal(SIGINT, handle_sigint);
+    signal(SIGINT,  handle_sigint);
     signal(SIGTERM, handle_sigint);
 
-    // Initial build/run
+    /* Initial build (synchronous), then start pre-cmd + main binary. */
     if (build_cmd) {
         log_info("Initial build...");
         if (system(build_cmd) != 0) {
             log_err("Initial build failed. Still starting watcher...");
-        } else {
-            start_process(run_cmd);
+            /* Start the app anyway so the watcher loop runs. */
         }
-    } else {
-        start_process(run_cmd);
     }
+    launch_all();
 
-    // Init watcher
+    /* Initialise watcher. */
     cnotify_t* cn = cnotify_init();
     if (!cn) {
         log_err("Failed to initialize watcher");
+        kill_all_children();
         return 1;
     }
 
@@ -552,50 +445,42 @@ int main(int argc, char* argv[]) {
     if (!exclude_list && exclude_str) {
         log_err("Failed to allocate memory for exclude list");
         cnotify_destroy(cn);
+        kill_all_children();
         return 1;
     }
 
-    // Attempt to automatically add the binary name to exclusion list
+    /*
+     * Auto-exclude the binary itself so that writing the compiled output
+     * into the watch tree does not trigger a second reload cycle.
+     */
     char* binary_name = extract_binary_name(run_cmd);
     if (binary_name) {
         if (verbose) printf("Auto-excluding binary: %s\n", binary_name);
 
-        // Count existing exclusions
         size_t count = 0;
-        if (exclude_list) {
-            while (exclude_list[count]) count++;
-        }
+        if (exclude_list) while (exclude_list[count]) count++;
 
-        // Reallocate list to add binary name
         const char** new_list = realloc((void*)exclude_list, sizeof(char*) * (count + 2));
         if (new_list) {
             exclude_list = new_list;
-            exclude_list[count] = binary_name;
+            exclude_list[count]     = binary_name;
             exclude_list[count + 1] = NULL;
         } else {
-            free(binary_name);  // Failed to add, but not fatal
+            free(binary_name); /* Non-fatal — watcher still runs. */
         }
     }
 
     log_info("Watching for changes...");
     if (cnotify_add_watch(cn, watch_path, exclude_list) < 0) {
         log_err("Failed to add watch");
+        /* Non-fatal: continue so the binary still runs even if watching fails. */
     }
 
-    // Pre-seed the hash map with all existing files so that the first
-    // modification of any tracked file is detected as a real content change.
-    preseed_hashes(watch_path);
-
-    cnotify_start_loop(cn, on_change, NULL);
-
+    cnotify_start_loop(cn, on_change, cn);
     cnotify_destroy(cn);
 
-    // Cleanup
-    free_hash_map();
     if (exclude_list) {
-        for (int i = 0; exclude_list[i]; i++) {
-            free((void*)exclude_list[i]);
-        }
+        for (int i = 0; exclude_list[i]; i++) free((void*)exclude_list[i]);
         free(exclude_list);
     }
 

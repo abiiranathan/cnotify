@@ -178,6 +178,19 @@ int cnotify_start_loop(cnotify_t* cn, cnotify_callback_t callback, void* userdat
  */
 const char* cnotify_event_type_name(cnotify_event_type_t type);
 
+
+/**
+ * Check whether the file at path has changed since it was last seen.
+ * Seeds the cache on first call. Returns 1 if changed, 0 if not.
+ */
+int cnotify_file_changed(cnotify_t* cn, const char* path);
+
+/**
+ * Remove path from the change-detection cache.
+ * Returns 1 if found and removed, 0 otherwise.
+ */
+int cnotify_file_remove(cnotify_t* cn, const char* path);
+
 #ifdef __cplusplus
 }
 #endif
