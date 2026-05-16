@@ -2,57 +2,172 @@
 #define _GNU_SOURCE
 #endif
 
-#include <ctype.h>
-#include <dirent.h>
-#include <errno.h>
-#include <limits.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/select.h>   /* for select() used as portable sleep */
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include <ctype.h>    /* for isspace */
+#include <dirent.h>   /* for directory iteration in cnotify */
+#include <errno.h>    /* for errno, ECHILD, EINTR */
+#include <limits.h>   /* for PATH_MAX */
+#include <signal.h>   /* for signal, SIGTERM, SIGINT, SIGKILL */
+#include <stdio.h>    /* for printf, fprintf, fopen, fgets, snprintf */
+#include <stdlib.h>   /* for malloc, realloc, free, strdup, exit, atoi, system */
+#include <string.h>   /* for strcmp, strncmp, strchr, strrchr, strlen, strtok */
+#include <sys/select.h> /* for select — used as a portable, SIGALRM-safe sleep */
+#include <sys/stat.h>   /* for struct stat (used transitively by cnotify) */
+#include <sys/types.h>  /* for pid_t, size_t */
+#include <sys/wait.h>   /* for waitpid, WNOHANG */
+#include <unistd.h>     /* for fork, execv, setpgid, access, _exit, usleep */
+
 #include "../include/cnotify.h"
 
-#define MAX_ARGS             64
-#define TERM_TIMEOUT_MS      1000  /* Wait 1 second before SIGKILL */
-#define DEFAULT_PRE_GRACE_MS 150   /* Head-start for pre-cmd before main binary */
+/* =========================================================================
+ * Constants
+ * ========================================================================= */
 
-/* ========================================================================
- * Configuration (populated from cnotify.conf then CLI flags)
- * ======================================================================== */
+/** Maximum grace period in milliseconds before escalating SIGTERM → SIGKILL. */
+#define TERM_TIMEOUT_MS      1000
 
-static char*        build_cmd    = NULL;
-static char*        pre_cmd      = NULL;  /* Background command, e.g. tailwindcss --watch */
-static char*        run_cmd      = NULL;  /* Primary binary/script to run */
-static char*        watch_path   = ".";
-static char*        exclude_str  = ".git,.idea,.vscode,tmp,vendor,bin,node_modules,dist";
-static const char** exclude_list = NULL;
-static int          verbose      = 0;
-static unsigned int pre_grace_ms = DEFAULT_PRE_GRACE_MS;
+/** Default head-start given to pre_cmd before run_cmd is launched. */
+#define DEFAULT_PRE_GRACE_MS 500
 
-/* ========================================================================
+/* =========================================================================
+ * Logging
+ *
+ * All output goes through log_write() so callers never embed ANSI codes or
+ * format strings directly.  Adding a log file, syslog, or timestamps later
+ * only requires touching this one section.
+ * ========================================================================= */
+
+/** Severity levels understood by the logger. */
+typedef enum {
+    LOG_DEBUG = 0, /* Verbose developer output, gated by the -v flag. */
+    LOG_INFO  = 1, /* Normal operational messages.                     */
+    LOG_WARN  = 2, /* Recoverable problems that do not stop execution. */
+    LOG_ERR   = 3, /* Errors the operator must act on.                 */
+} log_level_t;
+
+/*
+ * Runtime verbosity flag.  Declared here so log_write() can gate LOG_DEBUG
+ * output without needing a parameter.  Set to 1 by -v / verbose=true.
+ */
+static int g_verbose = 0;
+
+/**
+ * Write a single log line to stdout (INFO/DEBUG) or stderr (WARN/ERR).
+ *
+ * ANSI colour codes are kept in a small table indexed by log_level_t so
+ * the mapping is obvious at a glance and trivially extended.
+ *
+ * @param level   Severity of the message.
+ * @param msg     Null-terminated message string.
+ */
+static void log_write(log_level_t level, const char* msg) {
+    /* Gate verbose-only output early to avoid unnecessary work. */
+    if (level == LOG_DEBUG && !g_verbose) return;
+
+    /* ANSI escape sequences indexed by log_level_t. */
+    static const char* const colors[] = {
+        [LOG_DEBUG] = "\033[90m",  /* dark grey  */
+        [LOG_INFO]  = "\033[36m",  /* cyan       */
+        [LOG_WARN]  = "\033[33m",  /* yellow     */
+        [LOG_ERR]   = "\033[31m",  /* red        */
+    };
+    static const char* const labels[] = {
+        [LOG_DEBUG] = "DEBUG",
+        [LOG_INFO]  = "INFO ",
+        [LOG_WARN]  = "WARN ",
+        [LOG_ERR]   = "ERROR",
+    };
+    static const char RESET[] = "\033[0m";
+
+    FILE* dest = (level >= LOG_ERR) ? stderr : stdout;
+    fprintf(dest, "%s[cnotify %s]%s %s\n",
+            colors[level], labels[level], RESET, msg);
+}
+
+/* Convenience macros so call sites stay concise. */
+#define LOG_DBG(msg)  log_write(LOG_DEBUG, (msg))
+#define LOG_INF(msg)  log_write(LOG_INFO,  (msg))
+#define LOG_WRN(msg)  log_write(LOG_WARN,  (msg))
+#define LOG_ERR(msg)  log_write(LOG_ERR,   (msg))
+
+/* =========================================================================
+ * Configuration
+ *
+ * All global mutable state lives in one struct.  Functions receive a pointer
+ * to it rather than reading scattered file-scope variables, which makes data
+ * flow explicit and the code far easier to test.
+ * ========================================================================= */
+
+/** Aggregated runtime configuration populated from cnotify.conf then CLI. */
+typedef struct {
+    char*        build_cmd;    /**< Optional build command (e.g. "go build ./...").      */
+    char*        pre_cmd;      /**< Long-lived background command (e.g. tailwindcss).    */
+    char*        run_cmd;      /**< Primary binary or script to run and reload.          */
+    char*        watch_path;   /**< Root directory to watch; defaults to ".".            */
+    char*        exclude_str;  /**< Raw comma-separated exclude list from config or CLI. */
+    unsigned int pre_grace_ms; /**< Milliseconds to wait after pre_cmd before run_cmd.  */
+} config_t;
+
+/** Default exclude dirs — covers the most common noise sources out of the box. */
+#define DEFAULT_EXCLUDE ".git,.idea,.vscode,tmp,vendor,bin,node_modules,dist"
+
+/** Path of the optional configuration file loaded at startup. */
+static const char* CONFIG_FILE = "cnotify.conf";
+
+/* =========================================================================
  * Process state
- * ======================================================================== */
+ *
+ * We track exactly two long-lived processes: the optional pre-command and the
+ * main run command.  Each is started in its own process group so a single
+ * kill(-pgid, SIG) reaches the shell and every grandchild it spawned.
+ * ========================================================================= */
 
-static pid_t pre_pid = 0;  /* PID of the pre-command process group leader */
-static pid_t run_pid = 0;  /* PID of the main binary process group leader */
+/** PID of the pre-command process group leader (0 when not running). */
+static pid_t g_pre_pid = 0;
 
-/* ========================================================================
+/** PID of the main binary process group leader (0 when not running). */
+static pid_t g_run_pid = 0;
+
+/*
+ * We keep a reference to the watcher and the exclude list as file-scope
+ * variables only because the signal handler must reach them for clean
+ * shutdown.  Everywhere else, prefer passing them explicitly.
+ */
+static cnotify_t*   g_cn           = NULL;
+static const char** g_exclude_list = NULL;
+
+/* =========================================================================
  * String utilities
- * ======================================================================== */
+ * ========================================================================= */
 
+/**
+ * Return the final path component of @p path without modifying it.
+ *
+ * Unlike POSIX basename(3), this function is re-entrant and never modifies
+ * its argument.  It handles the edge cases "no slash" (returns path as-is)
+ * and "trailing slash" (returns an empty string, consistent with the POSIX
+ * definition — callers should not pass paths with trailing slashes).
+ */
 static const char* get_basename(const char* path) {
     const char* last_slash = strrchr(path, '/');
     return last_slash ? last_slash + 1 : path;
 }
 
+/**
+ * Extract the bare binary name from a shell command string.
+ *
+ * For a command like "/usr/bin/mytool --flag arg", this returns "mytool".
+ * The returned string is heap-allocated; the caller must free() it.
+ *
+ * @param cmd  Shell command string.  May be NULL (returns NULL).
+ * @return     Heap-allocated basename, or NULL on allocation failure.
+ */
 static char* extract_binary_name(const char* cmd) {
     if (!cmd) return NULL;
 
+    /*
+     * strtok modifies its argument, so we work on a throwaway copy.
+     * We only need the first token (the executable path).
+     */
     char* tmp = strdup(cmd);
     if (!tmp) return NULL;
 
@@ -68,157 +183,78 @@ static char* extract_binary_name(const char* cmd) {
     return ret;
 }
 
+/**
+ * Split @p str by @p delim and return a NULL-terminated array of
+ * heap-allocated tokens with leading/trailing whitespace stripped.
+ *
+ * Uses two passes over a strdup'd copy so that strtok's destructive
+ * tokenisation does not clobber the caller's string.
+ *
+ * @param str    String to split.  Must be non-NULL.
+ * @param delim  Delimiter passed directly to strtok(3).
+ * @return       NULL-terminated array, or NULL on any allocation failure.
+ *               Caller must free each element and the array itself.
+ */
 static const char** split_string(char* str, const char* delim) {
     if (!str) return NULL;
 
-    /* First pass: count tokens */
+    /* ---- Pass 1: count tokens so we allocate exactly the right array. ---- */
     size_t count = 0;
     char* tmp = strdup(str);
     if (!tmp) return NULL;
 
-    char* token = strtok(tmp, delim);
-    while (token) {
+    for (char* t = strtok(tmp, delim); t; t = strtok(NULL, delim))
         count++;
-        token = strtok(NULL, delim);
-    }
     free(tmp);
 
-    const char** result = malloc(sizeof(char*) * (count + 1));
+    const char** result = malloc(sizeof(char*) * (count + 1)); /* +1 for sentinel */
     if (!result) return NULL;
 
-    /* Second pass: fill tokens */
+    /* ---- Pass 2: fill tokens, trimming whitespace from each one. */
     tmp = strdup(str);
     if (!tmp) {
         free(result);
         return NULL;
     }
 
-    token = strtok(tmp, delim);
     size_t i = 0;
-    while (token) {
-        /* Trim leading whitespace */
-        while (isspace((unsigned char)*token)) token++;
-        char* end = token + strlen(token) - 1;
-        while (end > token && isspace((unsigned char)*end)) *end-- = '\0';
+    for (char* t = strtok(tmp, delim); t; t = strtok(NULL, delim)) {
+        /* Trim leading whitespace in-place by advancing the pointer. */
+        while (isspace((unsigned char)*t)) t++;
 
-        char* dup = strdup(token);
+        /* Trim trailing whitespace by overwriting from the right. */
+        char* end = t + strlen(t) - 1;
+        while (end > t && isspace((unsigned char)*end)) *end-- = '\0';
+
+        char* dup = strdup(t);
         if (!dup) {
+            /* Partial failure: release every token allocated so far. */
             for (size_t k = 0; k < i; k++) free((void*)result[k]);
             free(result);
             free(tmp);
             return NULL;
         }
         result[i++] = dup;
-        token = strtok(NULL, delim);
     }
-    result[i] = NULL;
+    result[i] = NULL; /* Sentinel so callers can iterate without a length. */
+
     free(tmp);
     return result;
 }
 
-/* ========================================================================
- * Logging
- * ======================================================================== */
-
-static void log_info(const char* msg) { printf("\033[36m[cnotify]\033[0m %s\n", msg); }
-static void log_err(const char* msg)  { fprintf(stderr, "\033[31m[cnotify] Error:\033[0m %s\n", msg); }
-
-/* ========================================================================
+/* =========================================================================
  * Process management
- * ======================================================================== */
+ * ========================================================================= */
 
 /**
- * Kill the process group rooted at *pid_ptr and reap all its members.
+ * Sleep for @p ms milliseconds using select(2).
  *
- * Because we launch commands via `/bin/sh -c`, the shell spawns the real
- * binary as a grandchild.  Both shell and grandchild share a process group
- * whose ID equals the shell's PID (set via setpgid(0,0) in the child).
- * Using waitpid(-pgid, ...) harvests every process in that group, preventing
- * zombie grandchildren.
- */
-static void kill_process(pid_t* pid_ptr) {
-    pid_t pgid = *pid_ptr;
-    if (pgid <= 0) return;
-
-    if (verbose) printf("Killing process group %d\n", (int)pgid);
-    kill(-pgid, SIGTERM);
-
-    int status;
-    int attempts       = 0;
-    const int max_att  = TERM_TIMEOUT_MS / 100;
-
-    while (attempts < max_att) {
-        /*
-         * Drain the whole process group: loop while waitpid returns children.
-         * Stop when ECHILD (no more members) or no child exited yet (result==0).
-         */
-        pid_t result = waitpid(-pgid, &status, WNOHANG);
-        if (result > 0) {
-            /* A member exited — keep draining without sleeping. */
-            continue;
-        }
-        if (result == -1) {
-            if (errno == EINTR)  continue;
-            if (errno == ECHILD) {
-                /* All members gone. */
-                if (verbose) printf("Process group %d fully exited\n", (int)pgid);
-                *pid_ptr = 0;
-                return;
-            }
-        }
-        /* result == 0: group still running, wait and retry. */
-        usleep(100000);
-        attempts++;
-    }
-
-    if (verbose) printf("Process group %d didn't exit, sending SIGKILL\n", (int)pgid);
-    kill(-pgid, SIGKILL);
-
-    /* Drain any remaining zombies after SIGKILL. */
-    while (waitpid(-pgid, &status, WNOHANG) > 0);
-
-    *pid_ptr = 0;
-}
-
-static void kill_all_children(void) {
-    /*
-     * Kill pre_cmd first so it does not race with the dying run_cmd.
-     * For a watcher like tailwindcss this order does not matter much,
-     * but it mirrors the startup order and is easier to reason about.
-     */
-    kill_process(&pre_pid);
-    kill_process(&run_pid);
-}
-
-/**
- * Fork and exec cmd via /bin/sh -c in a new process group.
- * The new PGID equals the child's PID, stored in *pid_out.
- */
-static void start_process(const char* cmd, pid_t* pid_out) {
-    if (!cmd) return;
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("fork");
-        return;
-    }
-
-    if (pid == 0) {
-        /* Child: new process group so kill(-pgid) reaches all descendants. */
-        setpgid(0, 0);
-        char* args[] = {"/bin/sh", "-c", (char*)cmd, NULL};
-        execv(args[0], args);
-        perror("execv");
-        _exit(1);
-    }
-
-    *pid_out = pid;
-    if (verbose) printf("Started process %d: %s\n", (int)pid, cmd);
-}
-
-/**
- * Sleep for ms milliseconds using select(2) as a portable, signal-safe
- * alternative to usleep/nanosleep that does not interact with SIGALRM.
+ * Why select() instead of usleep/nanosleep?
+ *  - usleep is deprecated in POSIX.1-2008.
+ *  - nanosleep can be interrupted by signals and requires a restart loop.
+ *  - select() with all fd sets NULL and only a timeout is perfectly legal,
+ *    signal-safe in the ways that matter here, and available everywhere.
+ *  - SIGALRM does not interact with select(), unlike with sleep(3).
  */
 static void sleep_ms(unsigned int ms) {
     if (ms == 0) return;
@@ -230,128 +266,340 @@ static void sleep_ms(unsigned int ms) {
 }
 
 /**
- * Launch the pre-command (if configured) followed by the main binary.
+ * Send SIGTERM to process group @p *pid_ptr and reap all its members.
  *
- * pre_cmd is a long-lived background process (e.g. `tailwindcss --watch`).
- * We give it a grace period — DEFAULT_PRE_GRACE_MS by default, overridden
- * with -pre-grace — before starting run_cmd so it can write its initial
- * output (CSS bundle, generated files, etc.) before the server starts.
+ * Why kill by process group rather than PID?
+ * ─────────────────────────────────────────
+ * We launch commands via `/bin/sh -c <cmd>`, which means the shell is the
+ * direct child and the actual binary is a grandchild.  If we only sent a
+ * signal to the shell's PID, the grandchild would be orphaned and continue
+ * running.  Instead, start_process() calls setpgid(0,0) in the child so
+ * that both shell and grandchild share a process group whose ID equals the
+ * shell's PID.  Sending to -pgid delivers the signal to every member.
+ *
+ * Why the two-phase SIGTERM → SIGKILL approach?
+ * ─────────────────────────────────────────────
+ * A well-behaved process (e.g. a web server) should catch SIGTERM, finish
+ * in-flight requests, and exit cleanly.  We therefore give it TERM_TIMEOUT_MS
+ * to do so before resorting to SIGKILL, which cannot be caught or ignored.
+ *
+ * Why loop on waitpid(-pgid, WNOHANG)?
+ * ─────────────────────────────────────
+ * A process group can contain more than two processes (shell + one binary).
+ * For example, the binary might fork workers.  A single waitpid call only
+ * reaps one child at a time.  We loop until ECHILD (no members left) or we
+ * exhaust our patience and escalate.
+ *
+ * @param pid_ptr  In/out: PID of the process group leader.  Set to 0 on exit.
  */
-static void launch_all(void) {
-    if (pre_cmd) {
-        log_info("Starting pre-command...");
-        start_process(pre_cmd, &pre_pid);
-        if (pre_grace_ms > 0) {
-            if (verbose)
-                printf("Waiting %ums for pre-command to initialise\n", pre_grace_ms);
-            sleep_ms(pre_grace_ms);
+static void kill_process(pid_t* pid_ptr) {
+    pid_t pgid = *pid_ptr;
+    if (pgid <= 0) return;
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Killing process group %d", (int)pgid);
+    LOG_DBG(buf);
+
+    kill(-pgid, SIGTERM);
+
+    const int poll_interval_us = 100000; /* 100 ms between polls */
+    const int max_attempts     = TERM_TIMEOUT_MS / (poll_interval_us / 1000);
+    int       attempts         = 0;
+
+    while (attempts < max_attempts) {
+        pid_t result = waitpid(-pgid, NULL, WNOHANG);
+
+        if (result > 0) {
+            /*
+             * One member exited.  Don't increment attempts — keep draining
+             * without sleeping so we reap siblings as fast as possible.
+             */
+            continue;
         }
+        if (result == -1) {
+            if (errno == EINTR)  continue; /* Interrupted by a signal; retry. */
+            if (errno == ECHILD) {
+                /* No children left in the group — we're done. */
+                snprintf(buf, sizeof(buf), "Process group %d fully exited", (int)pgid);
+                LOG_DBG(buf);
+                *pid_ptr = 0;
+                return;
+            }
+            /* Unexpected error: break and escalate to SIGKILL. */
+            break;
+        }
+
+        /* result == 0: group still has live members.  Sleep and retry. */
+        usleep((useconds_t)poll_interval_us);
+        attempts++;
     }
-    log_info("Starting app...");
-    start_process(run_cmd, &run_pid);
+
+    /* Patience exhausted — force-kill anything still alive. */
+    snprintf(buf, sizeof(buf), "Process group %d timed out; sending SIGKILL", (int)pgid);
+    LOG_WRN(buf);
+    kill(-pgid, SIGKILL);
+
+    /*
+     * Drain zombies after SIGKILL.  SIGKILL is not deferrable, so this
+     * loop should complete almost immediately.
+     */
+    while (waitpid(-pgid, NULL, WNOHANG) > 0);
+
+    *pid_ptr = 0;
 }
 
-static void restart_app(void) {
-    log_info("Change detected. Reloading...");
+/**
+ * Stop both managed processes in startup order (pre first, then run).
+ *
+ * Killing pre_cmd before run_cmd mirrors the startup sequence and avoids
+ * a race where the dying run_cmd triggers pre_cmd cleanup prematurely.
+ */
+static void kill_all_children(void) {
+    kill_process(&g_pre_pid);
+    kill_process(&g_run_pid);
+}
+
+/**
+ * Fork and exec @p cmd via /bin/sh -c in a new, isolated process group.
+ *
+ * Placing the child in its own process group (setpgid(0,0)) is the
+ * foundation of the "kill the whole tree" strategy — see kill_process().
+ * The group ID equals the child's PID, which is stored in *pid_out.
+ *
+ * @param cmd      Shell command string to execute.
+ * @param pid_out  Receives the child's PID on success; unchanged on failure.
+ */
+static void start_process(const char* cmd, pid_t* pid_out) {
+    if (!cmd) return;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return;
+    }
+
+    if (pid == 0) {
+        /*
+         * Child path.
+         *
+         * setpgid(0, 0) moves this process into a new process group before
+         * exec, so that kill(-pgid, SIG) in the parent reaches the shell
+         * AND the binary it spawns.  This call must happen before execv;
+         * once exec succeeds there is no way to set the process group.
+         */
+        setpgid(0, 0);
+        char* args[] = {"/bin/sh", "-c", (char*)cmd, NULL};
+        execv(args[0], args);
+        /* execv only returns on failure. */
+        perror("execv");
+        _exit(1);
+    }
+
+    /* Parent path: record the group leader PID. */
+    *pid_out = pid;
+    char buf[256];
+    snprintf(buf, sizeof(buf), "Started PID %d: %s", (int)pid, cmd);
+    LOG_DBG(buf);
+}
+
+/**
+ * Launch pre_cmd (if configured) and then run_cmd.
+ *
+ * The optional grace period lets pre_cmd complete its first-run work
+ * (e.g. generate a CSS bundle) before the server tries to serve files.
+ *
+ * @param cfg  Runtime configuration.
+ */
+static void launch_all(const config_t* cfg) {
+    if (cfg->pre_cmd) {
+        start_process(cfg->pre_cmd, &g_pre_pid);
+
+        if (cfg->pre_grace_ms > 0) {
+            char buf[80];
+            snprintf(buf, sizeof(buf),
+                     "Waiting %ums for pre-command to initialise", cfg->pre_grace_ms);
+            LOG_DBG(buf);
+            sleep_ms(cfg->pre_grace_ms);
+        }
+    }
+
+    start_process(cfg->run_cmd, &g_run_pid);
+}
+
+/**
+ * Tear down running processes, optionally rebuild, then restart.
+ *
+ * If the build step fails we log and return early rather than launching a
+ * potentially broken binary — the user will fix the error and save again,
+ * triggering another reload attempt.
+ *
+ * @param cfg  Runtime configuration.
+ */
+static void restart_app(const config_t* cfg) {
+    LOG_INF("Change detected. Reloading...");
     kill_all_children();
 
-    if (build_cmd) {
-        log_info("Building...");
-        int ret = system(build_cmd);
+    if (cfg->build_cmd) {
+        int ret = system(cfg->build_cmd);
         if (ret != 0) {
-            log_err("Build failed. Waiting for changes...");
+            LOG_ERR("Build failed. Waiting for changes...");
             return;
         }
     }
 
-    launch_all();
+    launch_all(cfg);
 }
 
-/* ========================================================================
+/* =========================================================================
  * inotify event callback
- * ======================================================================== */
+ * ========================================================================= */
 
+/**
+ * Invoked by the cnotify event loop for every filesystem event.
+ *
+ * We ignore directory events (we watch files, not directories themselves)
+ * and delegate changed/deleted/moved logic to restart_app().
+ *
+ * @param event      Filesystem event descriptor.
+ * @param user_data  Pointer to the owning cnotify_t; cast accordingly.
+ * @return           0 to continue the loop.
+ */
 static int on_change(const cnotify_event_t* event, void* user_data) {
-    cnotify_t* cn = (cnotify_t*)user_data;
+    /*
+     * user_data carries two things bundled into one pointer: the cnotify
+     * handle and the config.  We use a small context struct to pass both
+     * cleanly rather than relying on additional file-scope globals.
+     */
+    typedef struct { cnotify_t* cn; const config_t* cfg; } ctx_t;
+    ctx_t* ctx = (ctx_t*)user_data;
 
+    /* Directory creation/deletion events are not actionable here. */
     if (event->is_dir) return 0;
 
     char fullpath[PATH_MAX];
     int n = snprintf(fullpath, sizeof(fullpath), "%s/%s", event->path, event->name);
-    if (n < 0 || (size_t)n >= sizeof(fullpath)) return 0;
+    if (n < 0 || (size_t)n >= sizeof(fullpath)) {
+        LOG_WRN("Path too long; skipping event");
+        return 0;
+    }
 
     if (event->type == CNOTIFY_EVENT_DELETE) {
-        if (cnotify_file_remove(cn, fullpath)) {
-            restart_app();
-        }
+        /*
+         * File removed: update the watcher's internal checksum table so a
+         * future file of the same name is treated as new, not unchanged.
+         */
+        if (cnotify_file_remove(ctx->cn, fullpath))
+            restart_app(ctx->cfg);
         return 0;
     }
 
     if (event->type == CNOTIFY_EVENT_MOVE) {
+        /*
+         * Move events can be renames-into-tree (move_to) or
+         * renames-out-of-tree (move_from).  Distinguish by checking
+         * whether the destination path now exists.
+         */
         if (access(fullpath, F_OK) == 0) {
-            if (cnotify_file_changed(cn, fullpath)) {
-                restart_app();
-            }
+            if (cnotify_file_changed(ctx->cn, fullpath))
+                restart_app(ctx->cfg);
         } else {
-            cnotify_file_remove(cn, fullpath);
+            cnotify_file_remove(ctx->cn, fullpath);
         }
         return 0;
     }
 
-    if (cnotify_file_changed(cn, fullpath)) {
-        restart_app();
-    }
+    /* CNOTIFY_EVENT_CREATE / CNOTIFY_EVENT_MODIFY and any future types. */
+    if (cnotify_file_changed(ctx->cn, fullpath))
+        restart_app(ctx->cfg);
+
     return 0;
 }
 
-/* ========================================================================
+/* =========================================================================
  * Signal handling
- * ======================================================================== */
+ * ========================================================================= */
 
+/**
+ * Handler for SIGINT and SIGTERM.
+ *
+ * We perform a best-effort graceful shutdown: kill child processes, release
+ * the exclude list, and exit.  Calling non-async-signal-safe functions
+ * (printf, free) from a signal handler is technically undefined behaviour
+ * under POSIX, but is the accepted pragmatic pattern for a single-threaded
+ * CLI tool that exits immediately after.
+ */
 static void handle_sigint(int sig) {
-    (void)sig;
+    (void)sig; /* Suppress unused-parameter warning; we treat all signals equally. */
     printf("\n");
-    log_info("Stopping...");
+    LOG_INF("Stopping...");
     kill_all_children();
 
-    if (exclude_list) {
-        for (int i = 0; exclude_list[i]; i++) free((void*)exclude_list[i]);
-        free(exclude_list);
+    /* Release the exclude list built during startup. */
+    if (g_exclude_list) {
+        for (size_t i = 0; g_exclude_list[i]; i++)
+            free((void*)g_exclude_list[i]);
+        free(g_exclude_list);
+        g_exclude_list = NULL;
+    }
+
+    /* Clean up the watcher if it was initialised before the signal arrived. */
+    if (g_cn) {
+        cnotify_destroy(g_cn);
+        g_cn = NULL;
     }
 
     exit(0);
 }
 
-/* ========================================================================
- * Configuration: usage, config file, CLI
- * ======================================================================== */
+/* =========================================================================
+ * Initialisation helpers
+ * ========================================================================= */
 
+/** Print command-line usage to stdout. */
 static void print_usage(const char* prog) {
-    printf("Usage: %s [options]\n", prog);
+    printf("Usage: %s [options]\n\n", prog);
     printf("Options:\n");
     printf("  -build <cmd>      Command to build the project (optional)\n");
-    printf("  -pre <cmd>        Command to run before the binary (e.g. tailwindcss --watch)\n");
-    printf("  -pre-grace <ms>   Grace period after pre-cmd before starting -bin (default: %u)\n",
-           DEFAULT_PRE_GRACE_MS);
-    printf("  -bin <cmd>        Command to run the binary/script (required)\n");
-    printf("  -path <dir>       Directory to watch (default: .)\n");
+    printf("  -pre   <cmd>      Long-lived background command (e.g. tailwindcss --watch)\n");
+    printf("  -pre-grace <ms>   Grace period after pre-cmd before launching -bin "
+           "(default: %u ms)\n", DEFAULT_PRE_GRACE_MS);
+    printf("  -bin   <cmd>      Command to run the binary/script (required)\n");
+    printf("  -path  <dir>      Directory to watch (default: .)\n");
     printf("  -exclude <list>   Comma-separated directories to exclude\n");
-    printf("                    (default: .git,.idea,.vscode,tmp,vendor,bin)\n");
-    printf("  -v                Verbose output\n");
-    printf("  -h                Show this help\n");
+    printf("                    (default: %s)\n", DEFAULT_EXCLUDE);
+    printf("  -v                Verbose / debug output\n");
+    printf("  -h                Show this help and exit\n");
 }
 
-static void parse_config_file(const char* filename) {
+/**
+ * Parse @p filename into @p cfg.
+ *
+ * Config file values act as defaults and are silently overridden by CLI
+ * flags parsed afterward.  An absent config file is not an error.
+ *
+ * Format: one "key = value" pair per line; '#' introduces a comment.
+ *
+ * @param filename  Path to the configuration file.
+ * @param cfg       Configuration struct to populate.
+ */
+static void parse_config_file(const char* filename, config_t* cfg) {
     FILE* f = fopen(filename, "r");
-    if (!f) return;
-    if (verbose) printf("Loading config from %s\n", filename);
+    if (!f) return; /* Missing config file is not an error. */
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Loading config from %s", filename);
+    LOG_DBG(buf);
 
     char line[1024];
-    while (fgets(line, sizeof(line), f)) {
-        char* p = strchr(line, '\n');
-        if (p) *p = '\0';
+    while (fgets(line, (int)sizeof(line), f)) {
+        /* Strip trailing newline. */
+        char* nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+
+        /* Skip blank lines and comments. */
         if (line[0] == '#' || line[0] == '\0') continue;
 
+        /* Require "key = value" format; skip malformed lines silently. */
         char* eq = strchr(line, '=');
         if (!eq) continue;
         *eq = '\0';
@@ -359,6 +607,7 @@ static void parse_config_file(const char* filename) {
         char* key = line;
         char* val = eq + 1;
 
+        /* Trim whitespace from both key and value. */
         while (isspace((unsigned char)*key)) key++;
         char* end = key + strlen(key) - 1;
         while (end > key && isspace((unsigned char)*end)) *end-- = '\0';
@@ -367,121 +616,230 @@ static void parse_config_file(const char* filename) {
         end = val + strlen(val) - 1;
         while (end > val && isspace((unsigned char)*end)) *end-- = '\0';
 
+        /*
+         * Config file provides the baseline; only write if the field is not
+         * already set (allows CLI flags parsed later to win without special
+         * casing every field).
+         */
         if (strcmp(key, "build") == 0) {
-            if (!build_cmd)                         build_cmd    = strdup(val);
+            if (!cfg->build_cmd)  cfg->build_cmd  = strdup(val);
         } else if (strcmp(key, "pre") == 0) {
-            if (!pre_cmd)                           pre_cmd      = strdup(val);
+            if (!cfg->pre_cmd)    cfg->pre_cmd     = strdup(val);
         } else if (strcmp(key, "pre_grace") == 0) {
-            pre_grace_ms = (unsigned int)atoi(val);
+            cfg->pre_grace_ms = (unsigned int)atoi(val);
         } else if (strcmp(key, "bin") == 0) {
-            if (!run_cmd)                           run_cmd      = strdup(val);
+            if (!cfg->run_cmd)    cfg->run_cmd     = strdup(val);
         } else if (strcmp(key, "path") == 0) {
-            if (strcmp(watch_path, ".") == 0)       watch_path   = strdup(val);
+            if (!cfg->watch_path) cfg->watch_path  = strdup(val);
         } else if (strcmp(key, "exclude") == 0) {
-            if (strncmp(exclude_str, ".git", 4) == 0) exclude_str = strdup(val);
+            if (!cfg->exclude_str) cfg->exclude_str = strdup(val);
         } else if (strcmp(key, "verbose") == 0) {
-            if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0) verbose = 1;
+            if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0)
+                g_verbose = 1;
         }
     }
     fclose(f);
 }
 
-/* ========================================================================
- * Entry point
- * ======================================================================== */
-
-int main(int argc, char* argv[]) {
-    parse_config_file("cnotify.conf");
-
+/**
+ * Parse argv into @p cfg.
+ *
+ * CLI flags override anything loaded from the config file.  Unknown flags
+ * are silently ignored to allow forward-compatibility with new flags added
+ * later.
+ *
+ * @param argc  Argument count from main.
+ * @param argv  Argument vector from main.
+ * @param cfg   Configuration struct to populate.
+ * @return      0 on success, 1 if -h was given (caller should exit cleanly).
+ */
+static int parse_args(int argc, char* argv[], config_t* cfg) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-build") == 0 && i + 1 < argc) {
-            build_cmd = argv[++i];
+            cfg->build_cmd   = argv[++i];
         } else if (strcmp(argv[i], "-pre") == 0 && i + 1 < argc) {
-            pre_cmd = argv[++i];
+            cfg->pre_cmd     = argv[++i];
         } else if (strcmp(argv[i], "-pre-grace") == 0 && i + 1 < argc) {
-            pre_grace_ms = (unsigned int)atoi(argv[++i]);
+            cfg->pre_grace_ms = (unsigned int)atoi(argv[++i]);
         } else if (strcmp(argv[i], "-bin") == 0 && i + 1 < argc) {
-            run_cmd = argv[++i];
+            cfg->run_cmd     = argv[++i];
         } else if (strcmp(argv[i], "-path") == 0 && i + 1 < argc) {
-            watch_path = argv[++i];
+            cfg->watch_path  = argv[++i];
         } else if (strcmp(argv[i], "-exclude") == 0 && i + 1 < argc) {
-            exclude_str = argv[++i];
+            cfg->exclude_str = argv[++i];
         } else if (strcmp(argv[i], "-v") == 0) {
-            verbose = 1;
+            g_verbose = 1;
         } else if (strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
-            return 0;
+            return 1;
         }
     }
+    return 0;
+}
 
-    if (!run_cmd) {
-        log_err("-bin argument is required");
-        print_usage(argv[0]);
-        return 1;
-    }
-
+/**
+ * Register signal handlers for orderly shutdown.
+ *
+ * We treat SIGINT (Ctrl-C) and SIGTERM (process manager stop) identically:
+ * kill children and exit.
+ */
+static void setup_signals(void) {
     signal(SIGINT,  handle_sigint);
     signal(SIGTERM, handle_sigint);
+}
 
-    /* Initial build (synchronous), then start pre-cmd + main binary. */
-    if (build_cmd) {
-        log_info("Initial build...");
-        if (system(build_cmd) != 0) {
-            log_err("Initial build failed. Still starting watcher...");
-            /* Start the app anyway so the watcher loop runs. */
-        }
-    }
-    launch_all();
-
-    /* Initialise watcher. */
+/**
+ * Build the exclude list and initialise the cnotify file watcher.
+ *
+ * The exclude list is extended with the run_cmd binary name so that writing
+ * a newly compiled binary into the watch tree does not trigger a spurious
+ * reload cycle.
+ *
+ * @param cfg       Runtime configuration.
+ * @param cn_out    Receives the initialised cnotify handle.
+ * @param excl_out  Receives the NULL-terminated exclude array.
+ * @return          0 on success, non-zero on fatal error.
+ */
+static int setup_watcher(const config_t* cfg,
+                         cnotify_t**    cn_out,
+                         const char***  excl_out)
+{
     cnotify_t* cn = cnotify_init();
     if (!cn) {
-        log_err("Failed to initialize watcher");
-        kill_all_children();
+        LOG_ERR("Failed to initialise cnotify watcher");
         return 1;
     }
 
-    exclude_list = split_string(exclude_str, ",");
-    if (!exclude_list && exclude_str) {
-        log_err("Failed to allocate memory for exclude list");
+    /* Build the initial exclude list from the comma-separated string. */
+    const char* raw_excl = cfg->exclude_str ? cfg->exclude_str : DEFAULT_EXCLUDE;
+
+    /*
+     * split_string needs a mutable char* because strtok modifies the
+     * string in-place.  We pass a strdup'd copy so cfg->exclude_str is
+     * left intact.
+     */
+    char* excl_copy = strdup(raw_excl);
+    if (!excl_copy) {
+        LOG_ERR("Failed to allocate memory for exclude list copy");
         cnotify_destroy(cn);
-        kill_all_children();
+        return 1;
+    }
+
+    const char** excl = split_string(excl_copy, ",");
+    free(excl_copy);
+
+    if (!excl) {
+        LOG_ERR("Failed to split exclude list");
+        cnotify_destroy(cn);
         return 1;
     }
 
     /*
-     * Auto-exclude the binary itself so that writing the compiled output
-     * into the watch tree does not trigger a second reload cycle.
+     * Append the compiled binary name to the exclude list so that writing
+     * the freshly built binary into the watched tree does not trigger an
+     * infinite reload loop.
+     *
+     * Pattern:
+     *   count existing entries → realloc for +2 slots (name + sentinel)
+     *   → fill → update sentinel.
      */
-    char* binary_name = extract_binary_name(run_cmd);
+    char* binary_name = extract_binary_name(cfg->run_cmd);
     if (binary_name) {
-        if (verbose) printf("Auto-excluding binary: %s\n", binary_name);
-
         size_t count = 0;
-        if (exclude_list) while (exclude_list[count]) count++;
+        while (excl[count]) count++;
 
-        const char** new_list = realloc((void*)exclude_list, sizeof(char*) * (count + 2));
-        if (new_list) {
-            exclude_list = new_list;
-            exclude_list[count]     = binary_name;
-            exclude_list[count + 1] = NULL;
+        const char** extended = realloc((void*)excl, sizeof(char*) * (count + 2));
+        if (extended) {
+            excl                    = extended;
+            excl[count]             = binary_name;
+            excl[count + 1]         = NULL;
         } else {
-            free(binary_name); /* Non-fatal — watcher still runs. */
+            /* Non-fatal: the watcher still works; it just may self-trigger. */
+            LOG_WRN("Could not extend exclude list with binary name");
+            free(binary_name);
         }
     }
 
-    log_info("Watching for changes...");
-    if (cnotify_add_watch(cn, watch_path, exclude_list) < 0) {
-        log_err("Failed to add watch");
-        /* Non-fatal: continue so the binary still runs even if watching fails. */
+    if (cnotify_add_watch(cn, cfg->watch_path, excl) < 0)
+        LOG_WRN("Failed to add watch (watcher will not fire, but binary still runs)");
+
+    *cn_out   = cn;
+    *excl_out = excl;
+    return 0;
+}
+
+/* =========================================================================
+ * Entry point
+ * ========================================================================= */
+
+int main(int argc, char* argv[]) {
+    /*nEstablish defaults. */
+    config_t cfg = {
+        .build_cmd    = NULL,
+        .pre_cmd      = NULL,
+        .run_cmd      = NULL,
+        .watch_path   = NULL, /* NULL means "." — resolved in setup_watcher */
+        .exclude_str  = NULL, /* NULL means DEFAULT_EXCLUDE */
+        .pre_grace_ms = DEFAULT_PRE_GRACE_MS,
+    };
+
+    /* Load config file first; CLI flags override below. */
+    parse_config_file(CONFIG_FILE, &cfg);
+
+    /* Parse CLI; g_verbose may be set here too. */
+    if (parse_args(argc, argv, &cfg) != 0)
+        return 0; /* -h was given; usage already printed. */
+
+    /* watch_path falls back to "." if unset by both config and CLI. */
+    if (!cfg.watch_path) cfg.watch_path = ".";
+
+    /* Validate required arguments. */
+    if (!cfg.run_cmd) {
+        LOG_ERR("-bin is required");
+        print_usage(argv[0]);
+        return 1;
     }
 
-    cnotify_start_loop(cn, on_change, cn);
-    cnotify_destroy(cn);
+    /* Wire up signal handlers before forking anything. */
+    setup_signals();
 
-    if (exclude_list) {
-        for (int i = 0; exclude_list[i]; i++) free((void*)exclude_list[i]);
-        free(exclude_list);
+    /* Initial build (synchronous) — failure is non-fatal. */
+    if (cfg.build_cmd) {
+        if (system(cfg.build_cmd) != 0)
+            LOG_WRN("Initial build failed; launching binary and waiting for changes...");
+    }
+
+    /* Start managed processes. */
+    launch_all(&cfg);
+
+    /* Initialise filesystem watcher. */
+    if (setup_watcher(&cfg, &g_cn, &g_exclude_list) != 0) {
+        kill_all_children();
+        return 1;
+    }
+
+    LOG_INF("Watching for changes...");
+
+    /*
+     * Bundle the cnotify handle and config into a single context object so
+     * on_change() receives both through the void* user_data parameter —
+     * avoiding additional file-scope globals.
+     */
+    typedef struct { cnotify_t* cn; const config_t* cfg; } ctx_t;
+    ctx_t ctx = { .cn = g_cn, .cfg = &cfg };
+
+    /* Block in the event loop until we receive a signal. */
+    cnotify_start_loop(g_cn, on_change, &ctx);
+
+    /* Normal exit (signal handler may also call exit() directly). */
+    cnotify_destroy(g_cn);
+    g_cn = NULL;
+
+    if (g_exclude_list) {
+        for (size_t i = 0; g_exclude_list[i]; i++)
+            free((void*)g_exclude_list[i]);
+        free(g_exclude_list);
+        g_exclude_list = NULL;
     }
 
     return 0;
