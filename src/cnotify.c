@@ -6,7 +6,7 @@
  */
 
 #ifndef _GNU_SOURCE
-#define _GNU_SOURCE
+    #define _GNU_SOURCE
 #endif
 
 #include "../include/cnotify.h"
@@ -15,13 +15,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <stdalign.h>  /* for alignof */
-#include <stdbool.h>   /* for bool */
+#include <poll.h>     /* for poll, struct pollfd */
+#include <stdalign.h> /* for alignof */
+#include <stdbool.h>  /* for bool */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
-#include <sys/select.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -31,7 +31,7 @@
 
 #define INOTIFY_EVENT_SIZE  (sizeof(struct inotify_event))
 #define INOTIFY_BUF_LEN     (64 * (INOTIFY_EVENT_SIZE + NAME_MAX + 1))
-#define WATCH_HASH_SIZE     1024  /* must be a power of two */
+#define WATCH_HASH_SIZE     1024 /* must be a power of two */
 #define DEFAULT_DEBOUNCE_MS 100
 
 /*
@@ -41,10 +41,14 @@
  *                    (e.g. temporary files already deleted by the time we
  *                    read the event), reducing noise significantly.
  */
-#define WATCH_MASK                                                             \
-    (IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO |        \
-     IN_DELETE_SELF | IN_MOVE_SELF | IN_ATTRIB | IN_CLOSE_WRITE |             \
-     IN_ONLYDIR | IN_EXCL_UNLINK)
+#define WATCH_MASK                                                                                                 \
+    (IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF | IN_ATTRIB | \
+     IN_CLOSE_WRITE | IN_ONLYDIR | IN_EXCL_UNLINK)
+
+/* Poll slot indices into the pollfd array used by cnotify_start_loop(). */
+#define POLLFD_INOTIFY  0 /* inotify fd: real filesystem events              */
+#define POLLFD_STOPPIPE 1 /* read end of the self-pipe: async stop request  */
+#define POLLFD_COUNT    2
 
 /* ========================================================================
  * Internal types
@@ -54,8 +58,8 @@
  * Hash table node for watch descriptor -> path mapping.
  */
 typedef struct watch_node {
-    int              wd;   /* inotify watch descriptor */
-    char*            path; /* heap-allocated path string */
+    int wd;                  /* inotify watch descriptor */
+    char* path;              /* heap-allocated path string */
     struct watch_node* next; /* hash collision chain */
 } watch_node_t;
 
@@ -67,27 +71,28 @@ typedef struct watch_node {
  * change, making the common no-change path O(1) instead of O(file_size).
  */
 typedef struct file_record {
-    unsigned long    content_hash; /* djb2 hash of file bytes */
-    off_t            size;         /* st_size at last check */
-    time_t           mtime;        /* st_mtime at last check */
-    ino_t            ino;          /* st_ino — detects replace-by-rename */
-    struct file_record* next;      /* hash collision chain */
-    char             path[];       /* flexible array: path stored inline */
+    unsigned long content_hash; /* djb2 hash of file bytes */
+    off_t size;                 /* st_size at last check */
+    time_t mtime;               /* st_mtime at last check */
+    ino_t ino;                  /* st_ino — detects replace-by-rename */
+    struct file_record* next;   /* hash collision chain */
+    char path[];                /* flexible array: path stored inline */
 } file_record_t;
 
-#define FILE_HASH_SIZE 4096  /* larger than watch table; one slot per file */
+#define FILE_HASH_SIZE 4096 /* larger than watch table; one slot per file */
 
 /**
  * Main watcher context.
  */
 struct cnotify {
-    int            fd;                          /* inotify file descriptor */
-    watch_node_t*  table[WATCH_HASH_SIZE];      /* wd -> path hash table */
-    file_record_t* fcache[FILE_HASH_SIZE];      /* path -> file_record cache */
-    unsigned int   debounce_ms;                 /* debounce interval in ms */
-    char**         exclude_dirs;                /* borrowed; caller owns lifetime */
-    char*          event_buf;                   /* aligned, reusable read buffer */
-    size_t         event_buf_size;              /* size of event_buf in bytes */
+    int fd;                                /* inotify file descriptor */
+    int stop_pipe[2];                      /* [0]=read, [1]=write; self-pipe for async stop */
+    watch_node_t* table[WATCH_HASH_SIZE];  /* wd -> path hash table */
+    file_record_t* fcache[FILE_HASH_SIZE]; /* path -> file_record cache */
+    unsigned int debounce_ms;              /* debounce interval in ms */
+    char** exclude_dirs;                   /* borrowed; caller owns lifetime */
+    char* event_buf;                       /* aligned, reusable read buffer */
+    size_t event_buf_size;                 /* size of event_buf in bytes */
 };
 
 /* ========================================================================
@@ -118,7 +123,7 @@ static watch_node_t* watch_node_create(int wd, const char* path) {
         return NULL;
     }
 
-    node->wd   = wd;
+    node->wd = wd;
     node->next = NULL;
     return node;
 }
@@ -135,14 +140,14 @@ static int hash_insert(cnotify_t* cn, int wd, const char* path) {
     if (!node) return -1;
 
     unsigned int idx = hash_wd(wd);
-    node->next       = cn->table[idx];
-    cn->table[idx]   = node;
+    node->next = cn->table[idx];
+    cn->table[idx] = node;
     return 0;
 }
 
 static const char* hash_lookup(cnotify_t* cn, int wd) {
-    unsigned int    idx  = hash_wd(wd);
-    watch_node_t*   node = cn->table[idx];
+    unsigned int idx = hash_wd(wd);
+    watch_node_t* node = cn->table[idx];
 
     for (; node; node = node->next) {
         if (node->wd == wd) return node->path;
@@ -151,9 +156,9 @@ static const char* hash_lookup(cnotify_t* cn, int wd) {
 }
 
 static int hash_remove(cnotify_t* cn, int wd) {
-    unsigned int    idx  = hash_wd(wd);
-    watch_node_t*   node = cn->table[idx];
-    watch_node_t*   prev = NULL;
+    unsigned int idx = hash_wd(wd);
+    watch_node_t* node = cn->table[idx];
+    watch_node_t* prev = NULL;
 
     for (; node; prev = node, node = node->next) {
         if (node->wd == wd) {
@@ -200,25 +205,22 @@ static unsigned long str_hash(const char* str) {
     return hash;
 }
 
-static inline unsigned int fcache_idx(const char* path) {
-    return (unsigned int)(str_hash(path) % FILE_HASH_SIZE);
-}
+static inline unsigned int fcache_idx(const char* path) { return (unsigned int)(str_hash(path) % FILE_HASH_SIZE); }
 
 /**
  * Compute djb2 content hash for the file at path.
  * Returns 0 on success, -1 on error (errno set).
  */
 static int content_hash(const char* path, unsigned long* out) {
-    unsigned char  buf[65536]; /* 64 KiB read buffer — sweet spot for page cache */
-    unsigned long  hash = 5381;
-    size_t         n;
+    unsigned char buf[65536]; /* 64 KiB read buffer — sweet spot for page cache */
+    unsigned long hash = 5381;
+    size_t n;
 
     FILE* f = fopen(path, "rb");
     if (!f) return -1;
 
     while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-        for (size_t i = 0; i < n; i++)
-            hash = ((hash << 5) + hash) + (unsigned long)buf[i];
+        for (size_t i = 0; i < n; i++) hash = ((hash << 5) + hash) + (unsigned long)buf[i];
     }
 
     if (ferror(f)) {
@@ -246,21 +248,20 @@ static file_record_t* fcache_lookup(cnotify_t* cn, const char* path) {
  * The record stores the path inline via a flexible array member to avoid a
  * second allocation and improve cache locality.
  */
-static file_record_t* fcache_insert(cnotify_t* cn, const char* path,
-                                    unsigned long hash, const struct stat* st) {
+static file_record_t* fcache_insert(cnotify_t* cn, const char* path, unsigned long hash, const struct stat* st) {
     size_t path_len = strlen(path);
     file_record_t* rec = malloc(sizeof(*rec) + path_len + 1);
     if (!rec) return NULL;
 
     rec->content_hash = hash;
-    rec->size         = st->st_size;
-    rec->mtime        = st->st_mtime;
-    rec->ino          = st->st_ino;
+    rec->size = st->st_size;
+    rec->mtime = st->st_mtime;
+    rec->ino = st->st_ino;
     memcpy(rec->path, path, path_len + 1);
 
-    unsigned int idx  = fcache_idx(path);
-    rec->next         = cn->fcache[idx];
-    cn->fcache[idx]   = rec;
+    unsigned int idx = fcache_idx(path);
+    rec->next = cn->fcache[idx];
+    cn->fcache[idx] = rec;
     return rec;
 }
 
@@ -269,9 +270,9 @@ static file_record_t* fcache_insert(cnotify_t* cn, const char* path,
  * Returns 1 if a record was found and removed, 0 otherwise.
  */
 static int fcache_remove(cnotify_t* cn, const char* path) {
-    unsigned int    idx  = fcache_idx(path);
-    file_record_t*  curr = cn->fcache[idx];
-    file_record_t*  prev = NULL;
+    unsigned int idx = fcache_idx(path);
+    file_record_t* curr = cn->fcache[idx];
+    file_record_t* prev = NULL;
 
     for (; curr; prev = curr, curr = curr->next) {
         if (strcmp(curr->path, path) == 0) {
@@ -312,8 +313,8 @@ static void fcache_clear(cnotify_t* cn) {
  * Returns 1 if the file genuinely changed, 0 if unchanged or on error.
  */
 int cnotify_file_changed(cnotify_t* cn, const char* path) {
-    struct stat     st;
-    unsigned long   new_hash;
+    struct stat st;
+    unsigned long new_hash;
 
     if (stat(path, &st) < 0) {
         /*
@@ -336,8 +337,7 @@ int cnotify_file_changed(cnotify_t* cn, const char* path) {
      * Fast path: all three metadata fields match — high confidence the
      * file is unchanged.  Skip content hashing entirely.
      */
-    if (rec->size == st.st_size && rec->mtime == st.st_mtime && rec->ino == st.st_ino)
-        return 0;
+    if (rec->size == st.st_size && rec->mtime == st.st_mtime && rec->ino == st.st_ino) return 0;
 
     /*
      * Metadata changed.  Compute content hash to confirm a real change.
@@ -348,9 +348,9 @@ int cnotify_file_changed(cnotify_t* cn, const char* path) {
     if (content_hash(path, &new_hash) < 0) return 0;
 
     /* Update cached metadata regardless of hash result. */
-    rec->size  = st.st_size;
+    rec->size = st.st_size;
     rec->mtime = st.st_mtime;
-    rec->ino   = st.st_ino;
+    rec->ino = st.st_ino;
 
     if (rec->content_hash == new_hash) return 0; /* content identical */
 
@@ -363,9 +363,7 @@ int cnotify_file_changed(cnotify_t* cn, const char* path) {
  * Called on DELETE/MOVE_FROM events so stale entries don't accumulate.
  * Returns 1 if a record was found and removed, 0 otherwise.
  */
-int cnotify_file_remove(cnotify_t* cn, const char* path) {
-    return fcache_remove(cn, path);
-}
+int cnotify_file_remove(cnotify_t* cn, const char* path) { return fcache_remove(cn, path); }
 
 /* ========================================================================
  * Path utilities
@@ -376,13 +374,13 @@ int cnotify_file_remove(cnotify_t* cn, const char* path) {
  * Returns NULL on allocation failure or path too long.
  */
 static char* path_join(const char* dir, const char* name) {
-    size_t dir_len  = strlen(dir);
+    size_t dir_len = strlen(dir);
     size_t name_len = strlen(name);
 
     if (dir_len > PATH_MAX - name_len - 2) return NULL; /* overflow guard */
 
-    int    needs_slash = (dir_len > 0 && dir[dir_len - 1] != '/');
-    size_t total       = dir_len + (size_t)needs_slash + name_len + 1;
+    int needs_slash = (dir_len > 0 && dir[dir_len - 1] != '/');
+    size_t total = dir_len + (size_t)needs_slash + name_len + 1;
 
     char* path = malloc(total);
     if (!path) return NULL;
@@ -492,8 +490,7 @@ static int add_watch_recursive(cnotify_t* cn, const char* path) {
     while ((entry = readdir(dir)) != NULL) {
         /* Skip . and .. */
         if (entry->d_name[0] == '.' &&
-            (entry->d_name[1] == '\0' ||
-             (entry->d_name[1] == '.' && entry->d_name[2] == '\0')))
+            (entry->d_name[1] == '\0' || (entry->d_name[1] == '.' && entry->d_name[2] == '\0')))
             continue;
 
         if (is_excluded(cn, entry->d_name)) continue;
@@ -545,9 +542,7 @@ static void preseed_recurse(cnotify_t* cn, const char* dir) {
 
     struct dirent* ent;
     while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.' &&
-            (ent->d_name[1] == '\0' ||
-             (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
+        if (ent->d_name[0] == '.' && (ent->d_name[1] == '\0' || (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
             continue;
 
         if (is_excluded(cn, ent->d_name)) continue;
@@ -566,8 +561,7 @@ static void preseed_recurse(cnotify_t* cn, const char* dir) {
              */
             struct stat st;
             unsigned long hash;
-            if (stat(child, &st) == 0 && content_hash(child, &hash) == 0)
-                fcache_insert(cn, child, hash, &st);
+            if (stat(child, &st) == 0 && content_hash(child, &hash) == 0) fcache_insert(cn, child, hash, &st);
         }
     }
     closedir(d);
@@ -578,22 +572,24 @@ static void preseed_recurse(cnotify_t* cn, const char* dir) {
  * ======================================================================== */
 
 static cnotify_event_type_t mask_to_event_type(uint32_t mask) {
-    if (mask & IN_MODIFY)                              return CNOTIFY_EVENT_MODIFY;
-    if (mask & IN_CREATE)                              return CNOTIFY_EVENT_CREATE;
-    if (mask & IN_DELETE)                              return CNOTIFY_EVENT_DELETE;
+    if (mask & IN_MODIFY) return CNOTIFY_EVENT_MODIFY;
+    if (mask & IN_CREATE) return CNOTIFY_EVENT_CREATE;
+    if (mask & IN_DELETE) return CNOTIFY_EVENT_DELETE;
     if (mask & (IN_MOVED_FROM | IN_MOVED_TO | IN_MOVE_SELF)) return CNOTIFY_EVENT_MOVE;
-    if (mask & IN_ATTRIB)                              return CNOTIFY_EVENT_ATTRIB;
-    if (mask & IN_CLOSE_WRITE)                         return CNOTIFY_EVENT_CLOSE_WRITE;
+    if (mask & IN_ATTRIB) return CNOTIFY_EVENT_ATTRIB;
+    if (mask & IN_CLOSE_WRITE) return CNOTIFY_EVENT_CLOSE_WRITE;
     return CNOTIFY_EVENT_MODIFY; /* fallback */
 }
 
 /**
  * Process one inotify event and invoke the user callback.
  *
+ * @param ie  Pointer to the event header, aligned and located directly in
+ *            cn->event_buf.  ie->name (if ie->len > 0) points into the same
+ *            buffer, immediately following the fixed-size header.
  * @return The callback's return value, or 0 if the event was suppressed.
  */
-static int handle_event(cnotify_t* cn, const struct inotify_event* ie,
-                        cnotify_callback_t callback, void* userdata) {
+static int handle_event(cnotify_t* cn, const struct inotify_event* ie, cnotify_callback_t callback, void* userdata) {
     /* Events with no name are directory-level (e.g. IN_DELETE_SELF on root). */
     if (ie->len == 0) return 0;
 
@@ -632,13 +628,12 @@ static int handle_event(cnotify_t* cn, const struct inotify_event* ie,
      * Note: IN_IGNORED is checked *after* the CREATE branch so that a
      * rapid create-then-delete of a subdirectory doesn't leave a watch.
      */
-    if (ie->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF))
-        hash_remove(cn, ie->wd);
+    if (ie->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF)) hash_remove(cn, ie->wd);
 
     cnotify_event_t event = {
-        .type   = mask_to_event_type(ie->mask),
-        .path   = dir_path,
-        .name   = ie->name,
+        .type = mask_to_event_type(ie->mask),
+        .path = dir_path,
+        .name = ie->name,
         .cookie = ie->cookie,
         .is_dir = !!(ie->mask & IN_ISDIR),
     };
@@ -649,14 +644,17 @@ static int handle_event(cnotify_t* cn, const struct inotify_event* ie,
 /**
  * Read one buffer's worth of events from the inotify fd and dispatch them.
  *
- * Uses memcpy into a local struct to avoid strict-aliasing UB when casting
- * char* to struct inotify_event*.  The name field is read directly from the
- * buffer pointer (it follows the fixed header contiguously).
+ * struct inotify_event has a flexible array member (name[]), so events are
+ * read directly out of cn->event_buf without copying: the buffer was
+ * allocated with aligned_alloc() using the type's required alignment, and
+ * the kernel guarantees each successive event within the buffer starts at
+ * a correctly aligned offset. Casting the buffer pointer to
+ * struct inotify_event* is therefore well-defined, not a strict-aliasing
+ * violation.
  *
  * @return Number of events processed (>= 0), or -1 on read error.
  */
-static int process_events_once(cnotify_t* cn, cnotify_callback_t callback,
-                               void* userdata, int* stop_flag) {
+static int process_events_once(cnotify_t* cn, cnotify_callback_t callback, void* userdata, int* stop_flag) {
     ssize_t len = read(cn->fd, cn->event_buf, cn->event_buf_size);
     if (len < 0) {
         if (errno == EINTR || errno == EAGAIN) return 0;
@@ -668,34 +666,12 @@ static int process_events_once(cnotify_t* cn, cnotify_callback_t callback,
         return -1;
     }
 
-    int   processed = 0;
-    char* ptr       = cn->event_buf;
-    char* end       = cn->event_buf + len;
+    int processed = 0;
+    char* ptr = cn->event_buf;
+    char* end = cn->event_buf + len;
 
     while (ptr < end && !*stop_flag) {
-        /*
-         * Copy the fixed-size header to a local struct to avoid strict-
-         * aliasing undefined behaviour.  The flexible 'name' array lives
-         * immediately after in the buffer and is accessed via the original
-         * pointer — it is char data so aliasing rules don't apply to it.
-         */
-        struct inotify_event ie;
-        memcpy(&ie, ptr, sizeof(ie));
-
-        /*
-         * Reconstruct a pointer that has ie.name pointing into the buffer,
-         * giving handle_event access to the name without a heap allocation.
-         * We pass ie (by pointer to local copy) for the fixed fields, and
-         * provide the buffer pointer so name is accessible via ie->name
-         * after the cast — this is valid because we copied the header and
-         * the name bytes follow contiguously in the same allocation.
-         *
-         * To keep handle_event's signature clean we overlay the local copy
-         * back onto the buffer pointer. This is the canonical inotify idiom
-         * and is safe given the aligned_alloc() guarantee on event_buf.
-         */
         struct inotify_event* iep = (struct inotify_event*)ptr;
-        (void)ie; /* header already validated via memcpy; iep used below */
 
         int ret = handle_event(cn, iep, callback, userdata);
         if (ret != 0) {
@@ -716,8 +692,7 @@ static int process_events_once(cnotify_t* cn, cnotify_callback_t callback,
  *
  * @return Total events processed (>= 0), or -1 on a fatal error.
  */
-static int process_events_drain(cnotify_t* cn, cnotify_callback_t callback,
-                                void* userdata, int* stop_flag) {
+static int process_events_drain(cnotify_t* cn, cnotify_callback_t callback, void* userdata, int* stop_flag) {
     int flags = fcntl(cn->fd, F_GETFL, 0);
     if (flags < 0) return -1;
 
@@ -738,12 +713,28 @@ static int process_events_drain(cnotify_t* cn, cnotify_callback_t callback,
 
     /*
      * Restore blocking mode.  If this fails the fd is left non-blocking,
-     * which breaks the select() in the event loop.  This is an extremely
-     * unlikely OS error but we propagate it rather than silently corrupting
-     * the loop's blocking semantics.
+     * which breaks the next poll()/read() cycle in the event loop.  This is
+     * an extremely unlikely OS error but we propagate it rather than
+     * silently corrupting the loop's blocking semantics.
      */
     if (fcntl(cn->fd, F_SETFL, flags) < 0) return -1;
     return total;
+}
+
+/**
+ * Drain and discard whatever bytes are sitting in the stop self-pipe.
+ *
+ * Only ever needs to consume the sentinel byte(s) written by
+ * cnotify_request_stop(); the actual value is irrelevant.  The pipe's read
+ * end is non-blocking (set once at creation time), so this returns promptly
+ * even if, in principle, nothing were available.
+ */
+static void drain_stop_pipe(cnotify_t* cn) {
+    char buf[64];
+    ssize_t n;
+    do {
+        n = read(cn->stop_pipe[0], buf, sizeof(buf));
+    } while (n > 0);
 }
 
 /* ========================================================================
@@ -775,9 +766,9 @@ cnotify_t* cnotify_init(void) {
      * Round INOTIFY_BUF_LEN up to the next multiple of the alignment
      * of struct inotify_event.
      */
-    size_t align     = alignof(struct inotify_event);
-    size_t buf_size  = (INOTIFY_BUF_LEN + align - 1) & ~(align - 1);
-    cn->event_buf    = aligned_alloc(align, buf_size);
+    size_t align = alignof(struct inotify_event);
+    size_t buf_size = (INOTIFY_BUF_LEN + align - 1) & ~(align - 1);
+    cn->event_buf = aligned_alloc(align, buf_size);
     if (!cn->event_buf) {
         close(fd);
         free(cn);
@@ -785,9 +776,43 @@ cnotify_t* cnotify_init(void) {
         return NULL;
     }
 
-    cn->fd             = fd;
+    /*
+     * Self-pipe for async-signal-safe shutdown requests.
+     *
+     * cnotify_request_stop() only calls write(), which is async-signal-safe
+     * per POSIX, so it can be invoked directly from a signal handler.  The
+     * blocking loop then observes the pipe becoming readable via poll() and
+     * exits its own stack frame normally instead of the handler calling
+     * exit() out from under partially-run cleanup code.
+     */
+    if (pipe(cn->stop_pipe) < 0) {
+        int saved = errno;
+        close(fd);
+        free(cn->event_buf);
+        free(cn);
+        errno = saved;
+        return NULL;
+    }
+
+    /*
+     * Both ends non-blocking:
+     *   - read end: so drain_stop_pipe() can't block if called speculatively.
+     *   - write end: so a signal handler calling cnotify_request_stop()
+     *     never blocks even in the (extremely unlikely) case the pipe
+     *     buffer is full; losing a redundant wakeup byte is harmless
+     *     because one byte is all that's ever needed.
+     */
+    for (int i = 0; i < 2; i++) {
+        int pflags = fcntl(cn->stop_pipe[i], F_GETFL, 0);
+        if (pflags >= 0) fcntl(cn->stop_pipe[i], F_SETFL, pflags | O_NONBLOCK);
+
+        int fdflags = fcntl(cn->stop_pipe[i], F_GETFD, 0);
+        if (fdflags >= 0) fcntl(cn->stop_pipe[i], F_SETFD, fdflags | FD_CLOEXEC);
+    }
+
+    cn->fd = fd;
     cn->event_buf_size = buf_size;
-    cn->debounce_ms    = DEFAULT_DEBOUNCE_MS;
+    cn->debounce_ms = DEFAULT_DEBOUNCE_MS;
 
     return cn;
 }
@@ -799,6 +824,8 @@ cnotify_t* cnotify_init(void) {
 void cnotify_destroy(cnotify_t* cn) {
     if (!cn) return;
     if (cn->fd >= 0) close(cn->fd);
+    if (cn->stop_pipe[0] >= 0) close(cn->stop_pipe[0]);
+    if (cn->stop_pipe[1] >= 0) close(cn->stop_pipe[1]);
     hash_clear(cn);
     fcache_clear(cn);
     free(cn->event_buf);
@@ -817,8 +844,7 @@ void cnotify_destroy(cnotify_t* cn) {
  *
  * @return 0 on success, -1 on error (errno set).
  */
-int cnotify_add_watch(cnotify_t* cn, const char* path,
-                      const char* const* exclude_dirs) {
+int cnotify_add_watch(cnotify_t* cn, const char* path, const char* const* exclude_dirs) {
     if (!cn || !path) {
         errno = EINVAL;
         return -1;
@@ -902,8 +928,7 @@ int cnotify_get_fd(cnotify_t* cn) { return cn ? cn->fd : -1; }
  *
  * @return Number of events processed, or -1 on error (errno set).
  */
-int cnotify_process_events(cnotify_t* cn, cnotify_callback_t callback,
-                           void* userdata) {
+int cnotify_process_events(cnotify_t* cn, cnotify_callback_t callback, void* userdata) {
     if (!cn || !callback) {
         errno = EINVAL;
         return -1;
@@ -913,46 +938,91 @@ int cnotify_process_events(cnotify_t* cn, cnotify_callback_t callback,
 }
 
 /**
- * Run a blocking event loop until a callback returns non-zero.
+ * Request that a running cnotify_start_loop() stop as soon as possible.
  *
- * Uses select(2) to block until inotify data is available, then sleeps for
- * debounce_ms to let bursty events accumulate in the kernel buffer, then
- * drains the full queue in non-blocking mode.  The net effect is that a
- * rapid burst of writes (e.g. compiler output) fires the callback once
- * rather than once per file.
- *
- * @return 0 when a callback requested stop, -1 on a fatal error (errno set).
+ * Implemented as a single non-blocking write() to an internal pipe, both of
+ * which are async-signal-safe operations per POSIX (unlike, say, calling
+ * exit() or free() directly from a handler). cnotify_start_loop() wakes from
+ * poll() when the pipe's read end becomes readable, drains it, and returns 0
+ * from its own stack frame — so ordinary cleanup code around the call site
+ * still runs normally.
  */
-int cnotify_start_loop(cnotify_t* cn, cnotify_callback_t callback,
-                       void* userdata) {
+void cnotify_request_stop(cnotify_t* cn) {
+    if (!cn) return;
+    /* Value written is irrelevant; only presence of a byte matters. */
+    ssize_t ret = write(cn->stop_pipe[1], "x", 1);
+    (void)ret; /* Best-effort: EAGAIN (pipe full) just means a wakeup is already pending. */
+}
+
+/**
+ * Run a blocking event loop until the callback returns non-zero or
+ * cnotify_request_stop() is called.
+ *
+ * Uses poll(2) to block on two file descriptors at once: the inotify fd
+ * (real filesystem events) and the read end of the internal stop pipe
+ * (async shutdown requests). A single timeout parameter on that same
+ * poll() call implements the post-event debounce wait, so waiting for more
+ * data and waiting out the debounce period are unified into one blocking
+ * call instead of two.
+ *
+ * The net effect of the debounce step is that a rapid burst of writes
+ * (e.g. compiler output) fires the callback once rather than once per file.
+ *
+ * @return 0 when the loop stopped cleanly (callback request or stop
+ *         request), -1 on a fatal error (errno set).
+ */
+int cnotify_start_loop(cnotify_t* cn, cnotify_callback_t callback, void* userdata) {
     if (!cn || !callback) {
         errno = EINVAL;
         return -1;
     }
 
+    struct pollfd fds[POLLFD_COUNT];
+    fds[POLLFD_INOTIFY].fd = cn->fd;
+    fds[POLLFD_INOTIFY].events = POLLIN;
+    fds[POLLFD_STOPPIPE].fd = cn->stop_pipe[0];
+    fds[POLLFD_STOPPIPE].events = POLLIN;
+
     int stop = 0;
     while (!stop) {
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(cn->fd, &fds);
+        fds[POLLFD_INOTIFY].revents = 0;
+        fds[POLLFD_STOPPIPE].revents = 0;
 
-        int ret = select(cn->fd + 1, &fds, NULL, NULL, NULL);
+        int ret = poll(fds, POLLFD_COUNT, -1 /* block indefinitely */);
         if (ret < 0) {
             if (errno == EINTR) continue;
             return -1;
         }
 
+        if (fds[POLLFD_STOPPIPE].revents & (POLLIN | POLLHUP | POLLERR)) {
+            drain_stop_pipe(cn);
+            break;
+        }
+
+        if (!(fds[POLLFD_INOTIFY].revents & POLLIN)) {
+            /* Spurious wakeup or POLLERR/POLLHUP on the inotify fd. */
+            if (fds[POLLFD_INOTIFY].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                errno = EBADF;
+                return -1;
+            }
+            continue;
+        }
+
         /*
-         * Debounce sleep: let the kernel accumulate more events from a
-         * burst write so we drain them all in one pass.  select(0,...) is
-         * used as a portable, SIGALRM-independent sleep.
+         * Debounce wait: give the kernel a chance to accumulate more events
+         * from a burst write before we drain the queue.  This second poll()
+         * call blocks with a timeout on the *same* two descriptors, so a
+         * stop request arriving mid-debounce is honoured immediately rather
+         * than waiting out the full debounce period first.
          */
         if (cn->debounce_ms > 0) {
-            struct timeval tv = {
-                .tv_sec  = (time_t)(cn->debounce_ms / 1000),
-                .tv_usec = (suseconds_t)((cn->debounce_ms % 1000) * 1000),
-            };
-            select(0, NULL, NULL, NULL, &tv);
+            fds[POLLFD_STOPPIPE].revents = 0;
+            int dret = poll(&fds[POLLFD_STOPPIPE], 1, (int)cn->debounce_ms);
+            if (dret < 0 && errno != EINTR) return -1;
+            if (dret > 0 && (fds[POLLFD_STOPPIPE].revents & (POLLIN | POLLHUP | POLLERR))) {
+                drain_stop_pipe(cn);
+                break;
+            }
         }
 
         ret = process_events_drain(cn, callback, userdata, &stop);
@@ -968,12 +1038,19 @@ int cnotify_start_loop(cnotify_t* cn, cnotify_callback_t callback,
  */
 const char* cnotify_event_type_name(cnotify_event_type_t type) {
     switch (type) {
-        case CNOTIFY_EVENT_MODIFY:      return "MODIFY";
-        case CNOTIFY_EVENT_CREATE:      return "CREATE";
-        case CNOTIFY_EVENT_DELETE:      return "DELETE";
-        case CNOTIFY_EVENT_MOVE:        return "MOVE";
-        case CNOTIFY_EVENT_ATTRIB:      return "ATTRIB";
-        case CNOTIFY_EVENT_CLOSE_WRITE: return "CLOSE_WRITE";
-        default:                        return "UNKNOWN";
+        case CNOTIFY_EVENT_MODIFY:
+            return "MODIFY";
+        case CNOTIFY_EVENT_CREATE:
+            return "CREATE";
+        case CNOTIFY_EVENT_DELETE:
+            return "DELETE";
+        case CNOTIFY_EVENT_MOVE:
+            return "MOVE";
+        case CNOTIFY_EVENT_ATTRIB:
+            return "ATTRIB";
+        case CNOTIFY_EVENT_CLOSE_WRITE:
+            return "CLOSE_WRITE";
+        default:
+            return "UNKNOWN";
     }
 }

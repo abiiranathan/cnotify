@@ -1,15 +1,15 @@
 #ifndef _GNU_SOURCE
-#define _GNU_SOURCE
+    #define _GNU_SOURCE
 #endif
 
-#include <ctype.h>    /* for isspace */
-#include <dirent.h>   /* for directory iteration in cnotify */
-#include <errno.h>    /* for errno, ECHILD, EINTR */
-#include <limits.h>   /* for PATH_MAX */
-#include <signal.h>   /* for signal, SIGTERM, SIGINT, SIGKILL */
-#include <stdio.h>    /* for printf, fprintf, fopen, fgets, snprintf */
-#include <stdlib.h>   /* for malloc, realloc, free, strdup, exit, atoi, system */
-#include <string.h>   /* for strcmp, strncmp, strchr, strrchr, strlen, strtok */
+#include <ctype.h>      /* for isspace */
+#include <dirent.h>     /* for directory iteration in cnotify */
+#include <errno.h>      /* for errno, ECHILD, EINTR */
+#include <limits.h>     /* for PATH_MAX */
+#include <signal.h>     /* for signal, SIGTERM, SIGINT, SIGKILL */
+#include <stdio.h>      /* for printf, fprintf, fopen, fgets, snprintf */
+#include <stdlib.h>     /* for malloc, realloc, free, strdup, exit, atoi, system */
+#include <string.h>     /* for strcmp, strncmp, strchr, strrchr, strlen, strtok */
 #include <sys/select.h> /* for select — used as a portable, SIGALRM-safe sleep */
 #include <sys/stat.h>   /* for struct stat (used transitively by cnotify) */
 #include <sys/types.h>  /* for pid_t, size_t */
@@ -23,25 +23,17 @@
  * ========================================================================= */
 
 /** Maximum grace period in milliseconds before escalating SIGTERM → SIGKILL. */
-#define TERM_TIMEOUT_MS      1000
+#define TERM_TIMEOUT_MS 2000
 
 /** Default head-start given to pre_cmd before run_cmd is launched. */
 #define DEFAULT_PRE_GRACE_MS 500
 
-/* =========================================================================
- * Logging
- *
- * All output goes through log_write() so callers never embed ANSI codes or
- * format strings directly.  Adding a log file, syslog, or timestamps later
- * only requires touching this one section.
- * ========================================================================= */
-
 /** Severity levels understood by the logger. */
 typedef enum {
     LOG_DEBUG = 0, /* Verbose developer output, gated by the -v flag. */
-    LOG_INFO  = 1, /* Normal operational messages.                     */
-    LOG_WARN  = 2, /* Recoverable problems that do not stop execution. */
-    LOG_ERR   = 3, /* Errors the operator must act on.                 */
+    LOG_INFO = 1,  /* Normal operational messages.                     */
+    LOG_WARN = 2,  /* Recoverable problems that do not stop execution. */
+    LOG_ERR = 3,   /* Errors the operator must act on.                 */
 } log_level_t;
 
 /*
@@ -65,45 +57,36 @@ static void log_write(log_level_t level, const char* msg) {
 
     /* ANSI escape sequences indexed by log_level_t. */
     static const char* const colors[] = {
-        [LOG_DEBUG] = "\033[90m",  /* dark grey  */
-        [LOG_INFO]  = "\033[36m",  /* cyan       */
-        [LOG_WARN]  = "\033[33m",  /* yellow     */
-        [LOG_ERR]   = "\033[31m",  /* red        */
+        [LOG_DEBUG] = "\033[90m", /* dark grey  */
+        [LOG_INFO] = "\033[36m",  /* cyan       */
+        [LOG_WARN] = "\033[33m",  /* yellow     */
+        [LOG_ERR] = "\033[31m",   /* red        */
     };
     static const char* const labels[] = {
         [LOG_DEBUG] = "DEBUG",
-        [LOG_INFO]  = "INFO ",
-        [LOG_WARN]  = "WARN ",
-        [LOG_ERR]   = "ERROR",
+        [LOG_INFO] = "INFO ",
+        [LOG_WARN] = "WARN ",
+        [LOG_ERR] = "ERROR",
     };
     static const char RESET[] = "\033[0m";
 
     FILE* dest = (level >= LOG_ERR) ? stderr : stdout;
-    fprintf(dest, "%s[cnotify %s]%s %s\n",
-            colors[level], labels[level], RESET, msg);
+    fprintf(dest, "%s[cnotify %s]%s %s\n", colors[level], labels[level], RESET, msg);
 }
 
 /* Convenience macros so call sites stay concise. */
-#define LOG_DBG(msg)  log_write(LOG_DEBUG, (msg))
-#define LOG_INF(msg)  log_write(LOG_INFO,  (msg))
-#define LOG_WRN(msg)  log_write(LOG_WARN,  (msg))
-#define LOG_ERR(msg)  log_write(LOG_ERR,   (msg))
-
-/* =========================================================================
- * Configuration
- *
- * All global mutable state lives in one struct.  Functions receive a pointer
- * to it rather than reading scattered file-scope variables, which makes data
- * flow explicit and the code far easier to test.
- * ========================================================================= */
+#define LOG_DBG(msg) log_write(LOG_DEBUG, (msg))
+#define LOG_INF(msg) log_write(LOG_INFO, (msg))
+#define LOG_WRN(msg) log_write(LOG_WARN, (msg))
+#define LOG_ERR(msg) log_write(LOG_ERR, (msg))
 
 /** Aggregated runtime configuration populated from cnotify.conf then CLI. */
 typedef struct {
-    char*        build_cmd;    /**< Optional build command (e.g. "go build ./...").      */
-    char*        pre_cmd;      /**< Long-lived background command (e.g. tailwindcss).    */
-    char*        run_cmd;      /**< Primary binary or script to run and reload.          */
-    char*        watch_path;   /**< Root directory to watch; defaults to ".".            */
-    char*        exclude_str;  /**< Raw comma-separated exclude list from config or CLI. */
+    char* build_cmd;           /**< Optional build command (e.g. "go build ./...").      */
+    char* pre_cmd;             /**< Long-lived background command (e.g. tailwindcss).    */
+    char* run_cmd;             /**< Primary binary or script to run and reload.          */
+    char* watch_path;          /**< Root directory to watch; defaults to ".".            */
+    char* exclude_str;         /**< Raw comma-separated exclude list from config or CLI. */
     unsigned int pre_grace_ms; /**< Milliseconds to wait after pre_cmd before run_cmd.  */
 } config_t;
 
@@ -128,11 +111,18 @@ static pid_t g_pre_pid = 0;
 static pid_t g_run_pid = 0;
 
 /*
- * We keep a reference to the watcher and the exclude list as file-scope
- * variables only because the signal handler must reach them for clean
- * shutdown.  Everywhere else, prefer passing them explicitly.
+ * We keep a reference to the watcher as a file-scope variable only because
+ * the signal handler must reach it to request a clean shutdown. Everywhere
+ * else, prefer passing it explicitly.
+ *
+ * The handler itself does nothing more than call cnotify_request_stop(),
+ * which only performs a non-blocking write() to an internal pipe — an
+ * async-signal-safe operation per POSIX. All the non-signal-safe cleanup
+ * (killing children, freeing the exclude list, destroying the watcher) runs
+ * afterward in main(), once cnotify_start_loop() has returned normally from
+ * its own stack frame.
  */
-static cnotify_t*   g_cn           = NULL;
+static cnotify_t* g_cn = NULL;
 static const char** g_exclude_list = NULL;
 
 /* =========================================================================
@@ -203,8 +193,7 @@ static const char** split_string(char* str, const char* delim) {
     char* tmp = strdup(str);
     if (!tmp) return NULL;
 
-    for (char* t = strtok(tmp, delim); t; t = strtok(NULL, delim))
-        count++;
+    for (char* t = strtok(tmp, delim); t; t = strtok(NULL, delim)) count++;
     free(tmp);
 
     const char** result = malloc(sizeof(char*) * (count + 1)); /* +1 for sentinel */
@@ -255,11 +244,18 @@ static const char** split_string(char* str, const char* delim) {
  *  - select() with all fd sets NULL and only a timeout is perfectly legal,
  *    signal-safe in the ways that matter here, and available everywhere.
  *  - SIGALRM does not interact with select(), unlike with sleep(3).
+ *
+ * This is a plain fixed-duration sleep with no fd to wait on, so it is left
+ * as select() rather than poll(): poll(NULL, 0, ms) would be an equally
+ * valid one-line substitute, but there is no readiness/signal-race concern
+ * here for select() to lose to — unlike cnotify_start_loop()'s multiplexed
+ * wait, which now uses poll() specifically to watch two descriptors and a
+ * shared timeout at once.
  */
 static void sleep_ms(unsigned int ms) {
     if (ms == 0) return;
     struct timeval tv = {
-        .tv_sec  = (time_t)(ms / 1000),
+        .tv_sec = (time_t)(ms / 1000),
         .tv_usec = (suseconds_t)((ms % 1000) * 1000),
     };
     select(0, NULL, NULL, NULL, &tv);
@@ -303,8 +299,8 @@ static void kill_process(pid_t* pid_ptr) {
     kill(-pgid, SIGTERM);
 
     const int poll_interval_us = 100000; /* 100 ms between polls */
-    const int max_attempts     = TERM_TIMEOUT_MS / (poll_interval_us / 1000);
-    int       attempts         = 0;
+    const int max_attempts = TERM_TIMEOUT_MS / (poll_interval_us / 1000);
+    int attempts = 0;
 
     while (attempts < max_attempts) {
         pid_t result = waitpid(-pgid, NULL, WNOHANG);
@@ -317,7 +313,7 @@ static void kill_process(pid_t* pid_ptr) {
             continue;
         }
         if (result == -1) {
-            if (errno == EINTR)  continue; /* Interrupted by a signal; retry. */
+            if (errno == EINTR) continue; /* Interrupted by a signal; retry. */
             if (errno == ECHILD) {
                 /* No children left in the group — we're done. */
                 snprintf(buf, sizeof(buf), "Process group %d fully exited", (int)pgid);
@@ -416,8 +412,7 @@ static void launch_all(const config_t* cfg) {
 
         if (cfg->pre_grace_ms > 0) {
             char buf[80];
-            snprintf(buf, sizeof(buf),
-                     "Waiting %ums for pre-command to initialise", cfg->pre_grace_ms);
+            snprintf(buf, sizeof(buf), "Waiting %ums for pre-command to initialise", cfg->pre_grace_ms);
             LOG_DBG(buf);
             sleep_ms(cfg->pre_grace_ms);
         }
@@ -470,7 +465,10 @@ static int on_change(const cnotify_event_t* event, void* user_data) {
      * handle and the config.  We use a small context struct to pass both
      * cleanly rather than relying on additional file-scope globals.
      */
-    typedef struct { cnotify_t* cn; const config_t* cfg; } ctx_t;
+    typedef struct {
+        cnotify_t* cn;
+        const config_t* cfg;
+    } ctx_t;
     ctx_t* ctx = (ctx_t*)user_data;
 
     /* Directory creation/deletion events are not actionable here. */
@@ -488,8 +486,7 @@ static int on_change(const cnotify_event_t* event, void* user_data) {
          * File removed: update the watcher's internal checksum table so a
          * future file of the same name is treated as new, not unchanged.
          */
-        if (cnotify_file_remove(ctx->cn, fullpath))
-            restart_app(ctx->cfg);
+        if (cnotify_file_remove(ctx->cn, fullpath)) restart_app(ctx->cfg);
         return 0;
     }
 
@@ -500,8 +497,7 @@ static int on_change(const cnotify_event_t* event, void* user_data) {
          * whether the destination path now exists.
          */
         if (access(fullpath, F_OK) == 0) {
-            if (cnotify_file_changed(ctx->cn, fullpath))
-                restart_app(ctx->cfg);
+            if (cnotify_file_changed(ctx->cn, fullpath)) restart_app(ctx->cfg);
         } else {
             cnotify_file_remove(ctx->cn, fullpath);
         }
@@ -509,8 +505,7 @@ static int on_change(const cnotify_event_t* event, void* user_data) {
     }
 
     /* CNOTIFY_EVENT_CREATE / CNOTIFY_EVENT_MODIFY and any future types. */
-    if (cnotify_file_changed(ctx->cn, fullpath))
-        restart_app(ctx->cfg);
+    if (cnotify_file_changed(ctx->cn, fullpath)) restart_app(ctx->cfg);
 
     return 0;
 }
@@ -522,33 +517,19 @@ static int on_change(const cnotify_event_t* event, void* user_data) {
 /**
  * Handler for SIGINT and SIGTERM.
  *
- * We perform a best-effort graceful shutdown: kill child processes, release
- * the exclude list, and exit.  Calling non-async-signal-safe functions
- * (printf, free) from a signal handler is technically undefined behaviour
- * under POSIX, but is the accepted pragmatic pattern for a single-threaded
- * CLI tool that exits immediately after.
+ * This does the absolute minimum permitted in an async signal handler:
+ * request that the event loop stop, via a single non-blocking write() to
+ * cnotify's internal self-pipe (async-signal-safe per POSIX). It does NOT
+ * call printf(), free(), or exit() — all of which are unsafe to invoke from
+ * a signal handler and were previously called here. cnotify_start_loop()
+ * observes the pipe becoming readable via poll(), returns 0 from its own
+ * stack frame, and main() performs the actual shutdown sequence (killing
+ * children, freeing the exclude list, destroying the watcher) as ordinary
+ * post-loop code.
  */
 static void handle_sigint(int sig) {
-    (void)sig; /* Suppress unused-parameter warning; we treat all signals equally. */
-    printf("\n");
-    LOG_INF("Stopping...");
-    kill_all_children();
-
-    /* Release the exclude list built during startup. */
-    if (g_exclude_list) {
-        for (size_t i = 0; g_exclude_list[i]; i++)
-            free((void*)g_exclude_list[i]);
-        free(g_exclude_list);
-        g_exclude_list = NULL;
-    }
-
-    /* Clean up the watcher if it was initialised before the signal arrived. */
-    if (g_cn) {
-        cnotify_destroy(g_cn);
-        g_cn = NULL;
-    }
-
-    exit(0);
+    (void)sig; /* We treat SIGINT and SIGTERM identically. */
+    cnotify_request_stop(g_cn);
 }
 
 /* =========================================================================
@@ -561,8 +542,10 @@ static void print_usage(const char* prog) {
     printf("Options:\n");
     printf("  -build <cmd>      Command to build the project (optional)\n");
     printf("  -pre   <cmd>      Long-lived background command (e.g. tailwindcss --watch)\n");
-    printf("  -pre-grace <ms>   Grace period after pre-cmd before launching -bin "
-           "(default: %u ms)\n", DEFAULT_PRE_GRACE_MS);
+    printf(
+        "  -pre-grace <ms>   Grace period after pre-cmd before launching -bin "
+        "(default: %u ms)\n",
+        DEFAULT_PRE_GRACE_MS);
     printf("  -bin   <cmd>      Command to run the binary/script (required)\n");
     printf("  -path  <dir>      Directory to watch (default: .)\n");
     printf("  -exclude <list>   Comma-separated directories to exclude\n");
@@ -622,20 +605,19 @@ static void parse_config_file(const char* filename, config_t* cfg) {
          * casing every field).
          */
         if (strcmp(key, "build") == 0) {
-            if (!cfg->build_cmd)  cfg->build_cmd  = strdup(val);
+            if (!cfg->build_cmd) cfg->build_cmd = strdup(val);
         } else if (strcmp(key, "pre") == 0) {
-            if (!cfg->pre_cmd)    cfg->pre_cmd     = strdup(val);
+            if (!cfg->pre_cmd) cfg->pre_cmd = strdup(val);
         } else if (strcmp(key, "pre_grace") == 0) {
             cfg->pre_grace_ms = (unsigned int)atoi(val);
         } else if (strcmp(key, "bin") == 0) {
-            if (!cfg->run_cmd)    cfg->run_cmd     = strdup(val);
+            if (!cfg->run_cmd) cfg->run_cmd = strdup(val);
         } else if (strcmp(key, "path") == 0) {
-            if (!cfg->watch_path) cfg->watch_path  = strdup(val);
+            if (!cfg->watch_path) cfg->watch_path = strdup(val);
         } else if (strcmp(key, "exclude") == 0) {
             if (!cfg->exclude_str) cfg->exclude_str = strdup(val);
         } else if (strcmp(key, "verbose") == 0) {
-            if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0)
-                g_verbose = 1;
+            if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0) g_verbose = 1;
         }
     }
     fclose(f);
@@ -656,15 +638,15 @@ static void parse_config_file(const char* filename, config_t* cfg) {
 static int parse_args(int argc, char* argv[], config_t* cfg) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-build") == 0 && i + 1 < argc) {
-            cfg->build_cmd   = argv[++i];
+            cfg->build_cmd = argv[++i];
         } else if (strcmp(argv[i], "-pre") == 0 && i + 1 < argc) {
-            cfg->pre_cmd     = argv[++i];
+            cfg->pre_cmd = argv[++i];
         } else if (strcmp(argv[i], "-pre-grace") == 0 && i + 1 < argc) {
             cfg->pre_grace_ms = (unsigned int)atoi(argv[++i]);
         } else if (strcmp(argv[i], "-bin") == 0 && i + 1 < argc) {
-            cfg->run_cmd     = argv[++i];
+            cfg->run_cmd = argv[++i];
         } else if (strcmp(argv[i], "-path") == 0 && i + 1 < argc) {
-            cfg->watch_path  = argv[++i];
+            cfg->watch_path = argv[++i];
         } else if (strcmp(argv[i], "-exclude") == 0 && i + 1 < argc) {
             cfg->exclude_str = argv[++i];
         } else if (strcmp(argv[i], "-v") == 0) {
@@ -681,10 +663,11 @@ static int parse_args(int argc, char* argv[], config_t* cfg) {
  * Register signal handlers for orderly shutdown.
  *
  * We treat SIGINT (Ctrl-C) and SIGTERM (process manager stop) identically:
- * kill children and exit.
+ * request that cnotify_start_loop() stop, and let main() perform the
+ * actual teardown once control returns to it normally.
  */
 static void setup_signals(void) {
-    signal(SIGINT,  handle_sigint);
+    signal(SIGINT, handle_sigint);
     signal(SIGTERM, handle_sigint);
 }
 
@@ -700,10 +683,7 @@ static void setup_signals(void) {
  * @param excl_out  Receives the NULL-terminated exclude array.
  * @return          0 on success, non-zero on fatal error.
  */
-static int setup_watcher(const config_t* cfg,
-                         cnotify_t**    cn_out,
-                         const char***  excl_out)
-{
+static int setup_watcher(const config_t* cfg, cnotify_t** cn_out, const char*** excl_out) {
     cnotify_t* cn = cnotify_init();
     if (!cn) {
         LOG_ERR("Failed to initialise cnotify watcher");
@@ -750,9 +730,9 @@ static int setup_watcher(const config_t* cfg,
 
         const char** extended = realloc((void*)excl, sizeof(char*) * (count + 2));
         if (extended) {
-            excl                    = extended;
-            excl[count]             = binary_name;
-            excl[count + 1]         = NULL;
+            excl = extended;
+            excl[count] = binary_name;
+            excl[count + 1] = NULL;
         } else {
             /* Non-fatal: the watcher still works; it just may self-trigger. */
             LOG_WRN("Could not extend exclude list with binary name");
@@ -763,7 +743,7 @@ static int setup_watcher(const config_t* cfg,
     if (cnotify_add_watch(cn, cfg->watch_path, excl) < 0)
         LOG_WRN("Failed to add watch (watcher will not fire, but binary still runs)");
 
-    *cn_out   = cn;
+    *cn_out = cn;
     *excl_out = excl;
     return 0;
 }
@@ -773,13 +753,13 @@ static int setup_watcher(const config_t* cfg,
  * ========================================================================= */
 
 int main(int argc, char* argv[]) {
-    /*nEstablish defaults. */
+    /* Establish defaults. */
     config_t cfg = {
-        .build_cmd    = NULL,
-        .pre_cmd      = NULL,
-        .run_cmd      = NULL,
-        .watch_path   = NULL, /* NULL means "." — resolved in setup_watcher */
-        .exclude_str  = NULL, /* NULL means DEFAULT_EXCLUDE */
+        .build_cmd = NULL,
+        .pre_cmd = NULL,
+        .run_cmd = NULL,
+        .watch_path = NULL,  /* NULL means "." — resolved in setup_watcher */
+        .exclude_str = NULL, /* NULL means DEFAULT_EXCLUDE */
         .pre_grace_ms = DEFAULT_PRE_GRACE_MS,
     };
 
@@ -787,8 +767,7 @@ int main(int argc, char* argv[]) {
     parse_config_file(CONFIG_FILE, &cfg);
 
     /* Parse CLI; g_verbose may be set here too. */
-    if (parse_args(argc, argv, &cfg) != 0)
-        return 0; /* -h was given; usage already printed. */
+    if (parse_args(argc, argv, &cfg) != 0) return 0; /* -h was given; usage already printed. */
 
     /* watch_path falls back to "." if unset by both config and CLI. */
     if (!cfg.watch_path) cfg.watch_path = ".";
@@ -800,23 +779,21 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    /* Initialise filesystem watcher first: signal handlers reference g_cn,
+     * so it must be valid (or safely NULL, per cnotify_request_stop's NULL
+     * check) before we can wire up signal handling. */
+    if (setup_watcher(&cfg, &g_cn, &g_exclude_list) != 0) return 1;
+
     /* Wire up signal handlers before forking anything. */
     setup_signals();
 
     /* Initial build (synchronous) — failure is non-fatal. */
     if (cfg.build_cmd) {
-        if (system(cfg.build_cmd) != 0)
-            LOG_WRN("Initial build failed; launching binary and waiting for changes...");
+        if (system(cfg.build_cmd) != 0) LOG_WRN("Initial build failed; launching binary and waiting for changes...");
     }
 
     /* Start managed processes. */
     launch_all(&cfg);
-
-    /* Initialise filesystem watcher. */
-    if (setup_watcher(&cfg, &g_cn, &g_exclude_list) != 0) {
-        kill_all_children();
-        return 1;
-    }
 
     LOG_INF("Watching for changes...");
 
@@ -825,22 +802,31 @@ int main(int argc, char* argv[]) {
      * on_change() receives both through the void* user_data parameter —
      * avoiding additional file-scope globals.
      */
-    typedef struct { cnotify_t* cn; const config_t* cfg; } ctx_t;
-    ctx_t ctx = { .cn = g_cn, .cfg = &cfg };
+    typedef struct {
+        cnotify_t* cn;
+        const config_t* cfg;
+    } ctx_t;
+    ctx_t ctx = {.cn = g_cn, .cfg = &cfg};
 
-    /* Block in the event loop until we receive a signal. */
-    cnotify_start_loop(g_cn, on_change, &ctx);
+    /*
+     * Block in the event loop until a callback requests stop or a signal
+     * handler calls cnotify_request_stop() (SIGINT/SIGTERM). Either way,
+     * this returns normally rather than the process being torn down mid
+     * signal-handler, so everything below always runs.
+     */
+    if (cnotify_start_loop(g_cn, on_change, &ctx) < 0) LOG_ERR("Event loop exited due to an error");
 
-    /* Normal exit (signal handler may also call exit() directly). */
-    cnotify_destroy(g_cn);
-    g_cn = NULL;
+    LOG_INF("Stopping...");
+    kill_all_children();
 
     if (g_exclude_list) {
-        for (size_t i = 0; g_exclude_list[i]; i++)
-            free((void*)g_exclude_list[i]);
+        for (size_t i = 0; g_exclude_list[i]; i++) free((void*)g_exclude_list[i]);
         free(g_exclude_list);
         g_exclude_list = NULL;
     }
+
+    cnotify_destroy(g_cn);
+    g_cn = NULL;
 
     return 0;
 }

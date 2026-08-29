@@ -276,6 +276,8 @@ static int test_null_params(void) {
 
     cnotify_set_debounce(NULL, 100); /* should not crash */
 
+    cnotify_request_stop(NULL); /* should not crash */
+
     PASS();
     return 0;
 }
@@ -316,6 +318,81 @@ static int test_remove_watch(void) {
     return 0;
 }
 
+/*
+ * Test 11: cnotify_request_stop() unblocks cnotify_start_loop() promptly,
+ * even with no filesystem activity and even from a signal handler.
+ *
+ * This exercises the self-pipe mechanism that replaced select()-based
+ * EINTR timing: a SIGALRM fires after a short delay, its handler calls
+ * cnotify_request_stop() (the only thing it does — no exit(), no printf()),
+ * and the blocking loop must return 0 promptly rather than hanging forever
+ * waiting on the inotify fd.
+ */
+static volatile sig_atomic_t g_stop_test_cn_valid = 0;
+static cnotify_t* g_stop_test_cn = NULL;
+
+static void stop_test_alarm_handler(int sig) {
+    (void)sig;
+    if (g_stop_test_cn_valid) cnotify_request_stop(g_stop_test_cn);
+}
+
+static int never_called_callback(const cnotify_event_t* event, void* userdata) {
+    (void)event;
+    (void)userdata;
+    return 0; /* Should never actually be invoked in this test. */
+}
+
+static int test_request_stop(void) {
+    cnotify_t* cn;
+    struct sigaction sa, old_sa;
+    int ret;
+
+    TEST("request_stop unblocks event loop");
+
+    if (setup_test_dir() < 0) FAIL("setup failed");
+
+    cn = cnotify_init();
+    if (!cn) FAIL("init failed");
+
+    if (cnotify_add_watch(cn, TEST_DIR, NULL) < 0) {
+        cnotify_destroy(cn);
+        FAIL("add_watch failed");
+    }
+
+    /* No filesystem events will occur; only the alarm-driven stop request
+     * should ever unblock the loop below. */
+    cnotify_set_debounce(cn, 0);
+
+    g_stop_test_cn = cn;
+    g_stop_test_cn_valid = 1;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = stop_test_alarm_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; /* Deliberately no SA_RESTART: this also exercises the
+                      * EINTR-retry path in cnotify_start_loop()'s poll(). */
+    if (sigaction(SIGALRM, &sa, &old_sa) < 0) {
+        cnotify_destroy(cn);
+        FAIL("sigaction failed");
+    }
+
+    alarm(1); /* fires in 1 second */
+
+    ret = cnotify_start_loop(cn, never_called_callback, NULL);
+
+    alarm(0);
+    sigaction(SIGALRM, &old_sa, NULL);
+    g_stop_test_cn_valid = 0;
+    g_stop_test_cn = NULL;
+
+    cnotify_destroy(cn);
+
+    if (ret != 0) FAIL("start_loop did not return cleanly after request_stop");
+
+    PASS();
+    return 0;
+}
+
 static int count_lines(const char* path) {
     FILE* f;
     int lines = 0;
@@ -332,7 +409,7 @@ static int count_lines(const char* path) {
     return lines;
 }
 
-/* Test 11: CLI integration - unchanged atomic save should not reload */
+/* Test 12: CLI integration - unchanged atomic save should not reload */
 static int test_cli_unchanged_atomic_save(void) {
     char runner_path[256];
     char runlog_path[256];
@@ -425,6 +502,59 @@ static int test_cli_unchanged_atomic_save(void) {
     return 0;
 }
 
+/*
+ * Test 13: CLI integration - SIGTERM triggers a clean shutdown that
+ * actually kills the managed child process group.
+ *
+ * This is the end-to-end check that main.c's new shutdown path (signal
+ * handler -> cnotify_request_stop() -> cnotify_start_loop() returns ->
+ * main() runs kill_all_children()) really tears down the run_cmd process,
+ * rather than relying on exit() firing from within the handler.
+ */
+static int test_cli_sigterm_shutdown(void) {
+    char watched_path[256];
+    pid_t pid;
+    int status;
+    FILE* f;
+
+    TEST("CLI SIGTERM clean shutdown");
+
+    if (setup_test_dir() < 0) FAIL("setup failed");
+
+    snprintf(watched_path, sizeof(watched_path), "%s/watched.txt", TEST_DIR);
+    f = fopen(watched_path, "w");
+    if (!f) FAIL("failed to create watched file");
+    fprintf(f, "hello\n");
+    fclose(f);
+
+    pid = fork();
+    if (pid < 0) FAIL("fork failed");
+
+    if (pid == 0) {
+        execl("./bin/cnotify", "./bin/cnotify", "-path", TEST_DIR, "-bin", "sleep 60", (char*)NULL);
+        _exit(127);
+    }
+
+    usleep(500000); /* let cnotify start and fork the "sleep 60" child */
+
+    if (kill(pid, SIGTERM) < 0) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+        FAIL("failed to send SIGTERM");
+    }
+
+    /* cnotify itself should exit promptly (well under the old TERM_TIMEOUT_MS
+     * ceiling plus scheduling slack) now that the handler no longer blocks
+     * on the previous select()/EINTR timing. */
+    pid_t waited = waitpid(pid, &status, 0);
+    if (waited != pid) FAIL("cnotify process did not exit after SIGTERM");
+
+    if (!WIFEXITED(status) && !WIFSIGNALED(status)) FAIL("unexpected exit status shape");
+
+    PASS();
+    return 0;
+}
+
 int main(void) {
     printf("\n=== cnotify Test Suite ===\n\n");
 
@@ -438,7 +568,9 @@ int main(void) {
     test_event_detection();
     test_null_params();
     test_remove_watch();
+    test_request_stop();
     test_cli_unchanged_atomic_save();
+    test_cli_sigterm_shutdown();
 
     cleanup_test_dir();
 

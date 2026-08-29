@@ -12,6 +12,12 @@
  * trees for file system events. It handles recursive watching, dynamic directory
  * creation/deletion, and event debouncing.
  *
+ * The blocking event loop (cnotify_start_loop()) is implemented with poll(2)
+ * rather than select(2). This removes select's FD_SETSIZE bucket-rebuild cost
+ * on every iteration and, more importantly, lets the debounce wait and the
+ * "wait for more inotify data" wait share a single poll() call with one
+ * timeout instead of two separate blocking calls.
+ *
  * Thread safety: This library is NOT thread-safe. Each CNotify instance should
  * be used from a single thread only.
  */
@@ -162,13 +168,28 @@ int cnotify_process_events(cnotify_t* cn, cnotify_callback_t callback, void* use
  * This blocks until either:
  *   - The callback returns non-zero
  *   - An error occurs
- *   - The process receives a signal
+ *   - cnotify_request_stop() is called (e.g. from a signal handler)
+ *
+ * Internally this uses poll(2) on the inotify fd plus an internal self-pipe,
+ * so it is safe to request shutdown from an async signal handler without
+ * relying on EINTR timing.
  *
  * Common errno values on return:
- *   EINTR - Interrupted by signal
  *   EBADF - Invalid file descriptor
  */
 int cnotify_start_loop(cnotify_t* cn, cnotify_callback_t callback, void* userdata);
+
+/**
+ * @brief Request that a running cnotify_start_loop() return as soon as possible
+ *
+ * @param cn Watcher context (NULL is safe to pass; becomes a no-op)
+ *
+ * Async-signal-safe: this only writes one byte to an internal pipe, so it is
+ * safe to call directly from a signal handler (e.g. for SIGINT/SIGTERM) to
+ * cleanly unblock cnotify_start_loop() without calling exit() from within
+ * the handler itself.
+ */
+void cnotify_request_stop(cnotify_t* cn);
 
 /**
  * @brief Get human-readable event type name
@@ -177,7 +198,6 @@ int cnotify_start_loop(cnotify_t* cn, cnotify_callback_t callback, void* userdat
  * @return String name (never NULL, returns "UNKNOWN" for invalid types)
  */
 const char* cnotify_event_type_name(cnotify_event_type_t type);
-
 
 /**
  * Check whether the file at path has changed since it was last seen.
