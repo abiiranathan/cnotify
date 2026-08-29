@@ -5,6 +5,7 @@
 #include <ctype.h>      /* for isspace */
 #include <dirent.h>     /* for directory iteration in cnotify */
 #include <errno.h>      /* for errno, ECHILD, EINTR */
+#include <fnmatch.h>    /* for fnmatch pattern matching */
 #include <limits.h>     /* for PATH_MAX */
 #include <signal.h>     /* for signal, SIGTERM, SIGINT, SIGKILL */
 #include <stdio.h>      /* for printf, fprintf, fopen, fgets, snprintf */
@@ -87,6 +88,7 @@ typedef struct {
     char* run_cmd;             /**< Primary binary or script to run and reload.          */
     char* watch_path;          /**< Root directory to watch; defaults to ".".            */
     char* exclude_str;         /**< Raw comma-separated exclude list from config or CLI. */
+    char* ignore_str;          /**< Comma-separated file/pattern ignore list.            */
     unsigned int pre_grace_ms; /**< Milliseconds to wait after pre_cmd before run_cmd.  */
 } config_t;
 
@@ -124,6 +126,7 @@ static pid_t g_run_pid = 0;
  */
 static cnotify_t* g_cn = NULL;
 static const char** g_exclude_list = NULL;
+static const char** g_ignore_list = NULL;
 
 /* =========================================================================
  * String utilities
@@ -229,6 +232,67 @@ static const char** split_string(char* str, const char* delim) {
 
     free(tmp);
     return result;
+}
+
+/**
+ * Check whether a file should be ignored based on exact paths or glob patterns.
+ *
+ * Matches against bare filename, path relative to watch root, or full path,
+ * allowing patterns like "*.min.js", "*_test.go", or explicit paths like
+ * "static/css/styles.css".
+ *
+ * @param fullpath    Full path to the file.
+ * @param name        Bare filename.
+ * @param watch_path  Watched root directory path.
+ * @param patterns    NULL-terminated array of glob patterns / file paths.
+ * @return            1 if the file matches an ignore rule, 0 otherwise.
+ */
+static int should_ignore_file(const char* fullpath, const char* name, const char* watch_path, const char** patterns) {
+    if (!patterns) return 0;
+
+    /* Compute path relative to watch_path if fullpath starts with watch_path. */
+    const char* rel_path = fullpath;
+    if (watch_path) {
+        size_t wlen = strlen(watch_path);
+        if (strncmp(fullpath, watch_path, wlen) == 0) {
+            rel_path = fullpath + wlen;
+            while (*rel_path == '/') rel_path++;
+        }
+    }
+
+    /* Clean leading "./" from paths. */
+    while (rel_path[0] == '.' && rel_path[1] == '/') rel_path += 2;
+
+    const char* clean_path = fullpath;
+    while (clean_path[0] == '.' && clean_path[1] == '/') clean_path += 2;
+
+    for (size_t i = 0; patterns[i]; i++) {
+        const char* pat = patterns[i];
+        if (!pat || pat[0] == '\0') continue;
+
+        while (pat[0] == '.' && pat[1] == '/') pat += 2;
+
+        /* 1. Match against bare filename (e.g. *_test.go, *.min.css). */
+        if (fnmatch(pat, name, 0) == 0) return 1;
+
+        /* 2. Match against relative path within watch tree (e.g. static/css/styles.css). */
+        if (fnmatch(pat, rel_path, 0) == 0 || fnmatch(pat, rel_path, FNM_PATHNAME) == 0) return 1;
+
+        /* 3. Match against full / cleaned path. */
+        if (fnmatch(pat, clean_path, 0) == 0 || fnmatch(pat, fullpath, 0) == 0) return 1;
+
+        /* 4. Suffix match for subpath patterns (e.g. "css/styles.css" matching "static/css/styles.css"). */
+        size_t plen = strlen(pat);
+        size_t rlen = strlen(rel_path);
+        if (rlen >= plen) {
+            const char* suffix = rel_path + (rlen - plen);
+            if (strcmp(suffix, pat) == 0 && (suffix == rel_path || *(suffix - 1) == '/')) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
 }
 
 /* =========================================================================
@@ -461,13 +525,15 @@ static void restart_app(const config_t* cfg) {
  */
 static int on_change(const cnotify_event_t* event, void* user_data) {
     /*
-     * user_data carries two things bundled into one pointer: the cnotify
-     * handle and the config.  We use a small context struct to pass both
-     * cleanly rather than relying on additional file-scope globals.
+     * user_data carries three things bundled into one pointer: the cnotify
+     * handle, the config, and the ignore patterns list. We use a small
+     * context struct to pass all cleanly rather than relying on additional
+     * file-scope globals.
      */
     typedef struct {
         cnotify_t* cn;
         const config_t* cfg;
+        const char** ignore_list;
     } ctx_t;
     ctx_t* ctx = (ctx_t*)user_data;
 
@@ -478,6 +544,14 @@ static int on_change(const cnotify_event_t* event, void* user_data) {
     int n = snprintf(fullpath, sizeof(fullpath), "%s/%s", event->path, event->name);
     if (n < 0 || (size_t)n >= sizeof(fullpath)) {
         LOG_WRN("Path too long; skipping event");
+        return 0;
+    }
+
+    /* Check if the file matches any ignore rules (e.g. *.min.css, static/css/styles.css). */
+    if (should_ignore_file(fullpath, event->name, ctx->cfg->watch_path, ctx->ignore_list)) {
+        char buf[PATH_MAX + 64];
+        snprintf(buf, sizeof(buf), "Ignored change on %s (matched ignore pattern)", fullpath);
+        LOG_DBG(buf);
         return 0;
     }
 
@@ -548,8 +622,10 @@ static void print_usage(const char* prog) {
         DEFAULT_PRE_GRACE_MS);
     printf("  -bin   <cmd>      Command to run the binary/script (required)\n");
     printf("  -path  <dir>      Directory to watch (default: .)\n");
-    printf("  -exclude <list>   Comma-separated directories to exclude\n");
-    printf("                    (default: %s)\n", DEFAULT_EXCLUDE);
+    printf("  -exclude <list>   Comma-separated directories to exclude (appended\n");
+    printf("                    to default: %s)\n", DEFAULT_EXCLUDE);
+    printf("  -ignore  <list>   Comma-separated files or patterns to ignore\n");
+    printf("                    (e.g. \"static/css/styles.css, *_test.go, *.min.css\")\n");
     printf("  -v                Verbose / debug output\n");
     printf("  -h                Show this help and exit\n");
 }
@@ -616,6 +692,9 @@ static void parse_config_file(const char* filename, config_t* cfg) {
             if (!cfg->watch_path) cfg->watch_path = strdup(val);
         } else if (strcmp(key, "exclude") == 0) {
             if (!cfg->exclude_str) cfg->exclude_str = strdup(val);
+        } else if (strcmp(key, "ignore") == 0 || strcmp(key, "ignore_files") == 0 ||
+                   strcmp(key, "ignore_patterns") == 0) {
+            if (!cfg->ignore_str) cfg->ignore_str = strdup(val);
         } else if (strcmp(key, "verbose") == 0) {
             if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0) g_verbose = 1;
         }
@@ -649,6 +728,8 @@ static int parse_args(int argc, char* argv[], config_t* cfg) {
             cfg->watch_path = argv[++i];
         } else if (strcmp(argv[i], "-exclude") == 0 && i + 1 < argc) {
             cfg->exclude_str = argv[++i];
+        } else if ((strcmp(argv[i], "-ignore") == 0 || strcmp(argv[i], "-ignore-patterns") == 0) && i + 1 < argc) {
+            cfg->ignore_str = argv[++i];
         } else if (strcmp(argv[i], "-v") == 0) {
             g_verbose = 1;
         } else if (strcmp(argv[i], "-h") == 0) {
@@ -674,9 +755,10 @@ static void setup_signals(void) {
 /**
  * Build the exclude list and initialise the cnotify file watcher.
  *
- * The exclude list is extended with the run_cmd binary name so that writing
- * a newly compiled binary into the watch tree does not trigger a spurious
- * reload cycle.
+ * The exclude list is built by combining DEFAULT_EXCLUDE with any user-provided
+ * exclude directories, and is further extended with the run_cmd binary name so
+ * that writing a newly compiled binary into the watch tree does not trigger a
+ * spurious reload cycle.
  *
  * @param cfg       Runtime configuration.
  * @param cn_out    Receives the initialised cnotify handle.
@@ -690,15 +772,25 @@ static int setup_watcher(const config_t* cfg, cnotify_t** cn_out, const char*** 
         return 1;
     }
 
-    /* Build the initial exclude list from the comma-separated string. */
-    const char* raw_excl = cfg->exclude_str ? cfg->exclude_str : DEFAULT_EXCLUDE;
-
     /*
+     * Build the initial exclude list by combining the default excludes with
+     * any user-provided excludes, ensuring default noisy directories are always
+     * ignored.
+     *
      * split_string needs a mutable char* because strtok modifies the
-     * string in-place.  We pass a strdup'd copy so cfg->exclude_str is
-     * left intact.
+     * string in-place. We pass a heap-allocated copy so cfg is left intact.
      */
-    char* excl_copy = strdup(raw_excl);
+    char* excl_copy = NULL;
+    if (cfg->exclude_str && cfg->exclude_str[0] != '\0') {
+        size_t len = strlen(DEFAULT_EXCLUDE) + 1 + strlen(cfg->exclude_str) + 1;
+        excl_copy = malloc(len);
+        if (excl_copy) {
+            snprintf(excl_copy, len, "%s,%s", DEFAULT_EXCLUDE, cfg->exclude_str);
+        }
+    } else {
+        excl_copy = strdup(DEFAULT_EXCLUDE);
+    }
+
     if (!excl_copy) {
         LOG_ERR("Failed to allocate memory for exclude list copy");
         cnotify_destroy(cn);
@@ -759,7 +851,8 @@ int main(int argc, char* argv[]) {
         .pre_cmd = NULL,
         .run_cmd = NULL,
         .watch_path = NULL,  /* NULL means "." — resolved in setup_watcher */
-        .exclude_str = NULL, /* NULL means DEFAULT_EXCLUDE */
+        .exclude_str = NULL, /* Appended to DEFAULT_EXCLUDE */
+        .ignore_str = NULL,  /* NULL means no extra files/patterns ignored */
         .pre_grace_ms = DEFAULT_PRE_GRACE_MS,
     };
 
@@ -777,6 +870,15 @@ int main(int argc, char* argv[]) {
         LOG_ERR("-bin is required");
         print_usage(argv[0]);
         return 1;
+    }
+
+    /* Parse file ignore patterns if specified. */
+    if (cfg.ignore_str) {
+        char* ign_copy = strdup(cfg.ignore_str);
+        if (ign_copy) {
+            g_ignore_list = split_string(ign_copy, ",");
+            free(ign_copy);
+        }
     }
 
     /* Initialise filesystem watcher first: signal handlers reference g_cn,
@@ -798,15 +900,16 @@ int main(int argc, char* argv[]) {
     LOG_INF("Watching for changes...");
 
     /*
-     * Bundle the cnotify handle and config into a single context object so
-     * on_change() receives both through the void* user_data parameter —
-     * avoiding additional file-scope globals.
+     * Bundle the cnotify handle, config, and ignore list into a single context
+     * object so on_change() receives everything through the void* user_data
+     * parameter — avoiding additional file-scope globals.
      */
     typedef struct {
         cnotify_t* cn;
         const config_t* cfg;
+        const char** ignore_list;
     } ctx_t;
-    ctx_t ctx = {.cn = g_cn, .cfg = &cfg};
+    ctx_t ctx = {.cn = g_cn, .cfg = &cfg, .ignore_list = g_ignore_list};
 
     /*
      * Block in the event loop until a callback requests stop or a signal
@@ -823,6 +926,12 @@ int main(int argc, char* argv[]) {
         for (size_t i = 0; g_exclude_list[i]; i++) free((void*)g_exclude_list[i]);
         free(g_exclude_list);
         g_exclude_list = NULL;
+    }
+
+    if (g_ignore_list) {
+        for (size_t i = 0; g_ignore_list[i]; i++) free((void*)g_ignore_list[i]);
+        free(g_ignore_list);
+        g_ignore_list = NULL;
     }
 
     cnotify_destroy(g_cn);

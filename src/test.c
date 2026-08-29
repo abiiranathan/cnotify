@@ -555,6 +555,275 @@ static int test_cli_sigterm_shutdown(void) {
     return 0;
 }
 
+/*
+ * Test 14: CLI integration - Custom exclude preserves default exclude list.
+ *
+ * Verifies that passing a custom -exclude value appends to, rather than
+ * overwriting, the DEFAULT_EXCLUDE list. Changes inside .git (a default
+ * exclude) and custom_excl (a user exclude) should both be ignored.
+ */
+static int test_cli_custom_exclude_keeps_defaults(void) {
+    char runner_path[256];
+    char runlog_path[256];
+    char git_dir[256];
+    char git_file[256];
+    char custom_dir[256];
+    char custom_file[256];
+    char watched_path[256];
+    FILE* f;
+    pid_t pid;
+    int status;
+    int lines_initial;
+    int lines_after_git;
+    int lines_after_custom;
+    int lines_after_watched;
+
+    TEST("CLI custom exclude retains default exclude list");
+
+    if (setup_test_dir() < 0) FAIL("setup failed");
+
+    snprintf(runner_path, sizeof(runner_path), "%s/runner.sh", TEST_DIR);
+    snprintf(runlog_path, sizeof(runlog_path), "%s/run.log", TEST_DIR);
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", TEST_DIR);
+    snprintf(git_file, sizeof(git_file), "%s/.git/config", TEST_DIR);
+    snprintf(custom_dir, sizeof(custom_dir), "%s/custom_excl", TEST_DIR);
+    snprintf(custom_file, sizeof(custom_file), "%s/custom_excl/file.txt", TEST_DIR);
+    snprintf(watched_path, sizeof(watched_path), "%s/watched.txt", TEST_DIR);
+
+    mkdir(git_dir, 0755);
+    mkdir(custom_dir, 0755);
+
+    f = fopen(runner_path, "w");
+    if (!f) FAIL("failed to create runner script");
+    fprintf(f, "#!/bin/sh\necho run >> \"$1\"\nsleep 60\n");
+    fclose(f);
+    chmod(runner_path, 0755);
+
+    f = fopen(watched_path, "w");
+    if (!f) FAIL("failed to create watched file");
+    fprintf(f, "initial\n");
+    fclose(f);
+
+    pid = fork();
+    if (pid < 0) FAIL("fork failed");
+
+    if (pid == 0) {
+        /* Only specify custom_excl, runner.sh, and run.log in -exclude. .git should still be excluded! */
+        execl("./bin/cnotify", "./bin/cnotify", "-path", TEST_DIR, "-exclude", "custom_excl,run.log,runner.sh", "-bin",
+              "sh /tmp/cnotify_test/runner.sh /tmp/cnotify_test/run.log", (char*)NULL);
+        _exit(127);
+    }
+
+    usleep(900000);
+    lines_initial = count_lines(runlog_path);
+    if (lines_initial < 1) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        FAIL("initial process did not start");
+    }
+
+    /* 1. Modify file inside .git (default exclude): should NOT trigger reload. */
+    f = fopen(git_file, "w");
+    if (!f) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        FAIL("failed to write git file");
+    }
+    fprintf(f, "git change\n");
+    fclose(f);
+
+    usleep(900000);
+    lines_after_git = count_lines(runlog_path);
+    if (lines_after_git != lines_initial) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        FAIL("change in default exclude directory (.git) triggered reload");
+    }
+
+    /* 2. Modify file inside custom_excl (user exclude): should NOT trigger reload. */
+    f = fopen(custom_file, "w");
+    if (!f) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        FAIL("failed to write custom exclude file");
+    }
+    fprintf(f, "custom exclude change\n");
+    fclose(f);
+
+    usleep(900000);
+    lines_after_custom = count_lines(runlog_path);
+    if (lines_after_custom != lines_initial) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        FAIL("change in user exclude directory triggered reload");
+    }
+
+    /* 3. Modify normal watched file: SHOULD trigger reload. */
+    f = fopen(watched_path, "w");
+    if (!f) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        FAIL("failed to modify watched file");
+    }
+    fprintf(f, "updated content\n");
+    fclose(f);
+
+    usleep(1200000);
+    lines_after_watched = count_lines(runlog_path);
+
+    kill(pid, SIGTERM);
+    waitpid(pid, &status, 0);
+
+    if (lines_after_watched <= lines_after_custom) FAIL("change in watched file did not trigger reload");
+
+    PASS();
+    return 0;
+}
+
+/*
+ * Test 15: CLI integration - Ignore specific files and glob patterns.
+ *
+ * Verifies that exact path matching (static/css/styles.css) and glob patterns
+ * (*_test.go, *.min.js) are ignored properly and do not trigger reloads.
+ */
+static int test_cli_ignore_files_and_patterns(void) {
+    char runner_path[256];
+    char runlog_path[256];
+    char static_dir[256];
+    char css_dir[256];
+    char css_file[256];
+    char test_file[256];
+    char minjs_file[256];
+    char watched_path[256];
+    FILE* f;
+    pid_t pid;
+    int status;
+    int lines_initial;
+    int lines_after_ignored;
+    int lines_after_watched;
+
+    TEST("CLI file and glob pattern ignore integration");
+
+    if (setup_test_dir() < 0) FAIL("setup failed");
+
+    snprintf(runner_path, sizeof(runner_path), "%s/runner.sh", TEST_DIR);
+    snprintf(runlog_path, sizeof(runlog_path), "%s/run.log", TEST_DIR);
+    snprintf(static_dir, sizeof(static_dir), "%s/static", TEST_DIR);
+    snprintf(css_dir, sizeof(css_dir), "%s/static/css", TEST_DIR);
+    snprintf(css_file, sizeof(css_file), "%s/static/css/styles.css", TEST_DIR);
+    snprintf(test_file, sizeof(test_file), "%s/main_test.go", TEST_DIR);
+    snprintf(minjs_file, sizeof(minjs_file), "%s/bundle.min.js", TEST_DIR);
+    snprintf(watched_path, sizeof(watched_path), "%s/main.go", TEST_DIR);
+
+    mkdir(static_dir, 0755);
+    mkdir(css_dir, 0755);
+
+    f = fopen(runner_path, "w");
+    if (!f) FAIL("failed to create runner script");
+    fprintf(f, "#!/bin/sh\necho run >> \"$1\"\nsleep 60\n");
+    fclose(f);
+    chmod(runner_path, 0755);
+
+    f = fopen(css_file, "w");
+    if (!f) FAIL("failed to create css file");
+    fprintf(f, "body { color: red; }\n");
+    fclose(f);
+
+    f = fopen(test_file, "w");
+    if (!f) FAIL("failed to create test file");
+    fprintf(f, "package main\n");
+    fclose(f);
+
+    f = fopen(minjs_file, "w");
+    if (!f) FAIL("failed to create min.js file");
+    fprintf(f, "console.log(1);\n");
+    fclose(f);
+
+    f = fopen(watched_path, "w");
+    if (!f) FAIL("failed to create watched file");
+    fprintf(f, "package main\nfunc main() {}\n");
+    fclose(f);
+
+    pid = fork();
+    if (pid < 0) FAIL("fork failed");
+
+    if (pid == 0) {
+        execl("./bin/cnotify", "./bin/cnotify", "-path", TEST_DIR, "-exclude", "run.log,runner.sh", "-ignore",
+              "static/css/styles.css, *_test.go, *.min.js", "-bin",
+              "sh /tmp/cnotify_test/runner.sh /tmp/cnotify_test/run.log", (char*)NULL);
+        _exit(127);
+    }
+
+    usleep(900000);
+    lines_initial = count_lines(runlog_path);
+    if (lines_initial < 1) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        FAIL("initial process did not start");
+    }
+
+    /* 1. Modify exact ignored path: static/css/styles.css */
+    f = fopen(css_file, "w");
+    if (!f) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        FAIL("failed to modify css file");
+    }
+    fprintf(f, "body { color: blue; }\n");
+    fclose(f);
+    usleep(600000);
+
+    /* 2. Modify glob pattern file: *_test.go */
+    f = fopen(test_file, "w");
+    if (!f) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        FAIL("failed to modify test file");
+    }
+    fprintf(f, "package main\n// new test\n");
+    fclose(f);
+    usleep(600000);
+
+    /* 3. Modify glob pattern file: *.min.js */
+    f = fopen(minjs_file, "w");
+    if (!f) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        FAIL("failed to modify minjs file");
+    }
+    fprintf(f, "console.log(2);\n");
+    fclose(f);
+    usleep(600000);
+
+    lines_after_ignored = count_lines(runlog_path);
+    if (lines_after_ignored != lines_initial) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        FAIL("modifying ignored files/patterns caused reload");
+    }
+
+    /* 4. Modify normal watched file: main.go */
+    f = fopen(watched_path, "w");
+    if (!f) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        FAIL("failed to modify watched file");
+    }
+    fprintf(f, "package main\nfunc main() { /* changed */ }\n");
+    fclose(f);
+
+    usleep(1200000);
+    lines_after_watched = count_lines(runlog_path);
+
+    kill(pid, SIGTERM);
+    waitpid(pid, &status, 0);
+
+    if (lines_after_watched <= lines_after_ignored) FAIL("change in watched file did not trigger reload");
+
+    PASS();
+    return 0;
+}
+
 int main(void) {
     printf("\n=== cnotify Test Suite ===\n\n");
 
@@ -571,6 +840,8 @@ int main(void) {
     test_request_stop();
     test_cli_unchanged_atomic_save();
     test_cli_sigterm_shutdown();
+    test_cli_custom_exclude_keeps_defaults();
+    test_cli_ignore_files_and_patterns();
 
     cleanup_test_dir();
 
