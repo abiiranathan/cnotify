@@ -19,12 +19,8 @@
 
 #include "../include/cnotify.h"
 
-/* =========================================================================
- * Constants
- * ========================================================================= */
-
 /** Maximum grace period in milliseconds before escalating SIGTERM → SIGKILL. */
-#define TERM_TIMEOUT_MS 2000
+#define TERM_TIMEOUT_MS 1000
 
 /** Default head-start given to pre_cmd before run_cmd is launched. */
 #define DEFAULT_PRE_GRACE_MS 500

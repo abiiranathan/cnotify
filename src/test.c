@@ -1,32 +1,41 @@
 /*
- * test.c - Basic tests for cnotify library
+ * test.c - Comprehensive test suite for cnotify library
  *
- * Compile: gcc -Wall -Wextra -O2 test.c cnotify.c -o test_cnotify
+ * Compile: gcc -Wall -Wextra -Iinclude -O3 test.c cnotify.c -o test_cnotify
  */
 
+#ifndef _GNU_SOURCE
+    #define _GNU_SOURCE
+#endif
+
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include "../include/cnotify.h"
 
-#define TEST_DIR   "/tmp/cnotify_test"
 #define ANSI_GREEN "\x1b[32m"
 #define ANSI_RED   "\x1b[31m"
 #define ANSI_RESET "\x1b[0m"
 
+#define TEST_PATH_BUF_SIZE (PATH_MAX * 2)
+
 static int test_count = 0;
 static int test_passed = 0;
+static char g_test_dir[PATH_MAX] = {0};
 
-#define TEST(name)                                   \
-    do {                                             \
-        test_count++;                                \
-        printf("Test %d: %s... ", test_count, name); \
-        fflush(stdout);                              \
+#define TEST(name)                                        \
+    do {                                                  \
+        test_count++;                                     \
+        printf("Test %2d: %-52s ... ", test_count, name); \
+        fflush(stdout);                                   \
     } while (0)
 
 #define PASS()                                     \
@@ -41,29 +50,73 @@ static int test_passed = 0;
         return -1;                                         \
     } while (0)
 
-static void cleanup_test_dir(void) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", TEST_DIR);
-    system(cmd);
+/* Construct an absolute path inside g_test_dir safely without truncation warnings */
+static void test_path(char* out, size_t out_size, const char* rel_path) {
+    if (!rel_path || rel_path[0] == '\0') {
+        snprintf(out, out_size, "%s", g_test_dir);
+    } else {
+        snprintf(out, out_size, "%s/%s", g_test_dir, rel_path);
+    }
 }
 
+/* Recursively delete the temporary directory */
+static void cleanup_test_dir(void) {
+    if (g_test_dir[0] != '\0') {
+        char cmd[TEST_PATH_BUF_SIZE];
+        snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", g_test_dir);
+        (void)system(cmd);
+        g_test_dir[0] = '\0';
+    }
+}
+
+/* Create a fresh, isolated temporary directory using mkdtemp */
 static int setup_test_dir(void) {
     cleanup_test_dir();
-    if (mkdir(TEST_DIR, 0755) < 0 && errno != EEXIST) return -1;
+    char template_path[] = "/tmp/cnotify_test_XXXXXX";
+    char* dir = mkdtemp(template_path);
+    if (!dir) return -1;
+    strncpy(g_test_dir, dir, sizeof(g_test_dir) - 1);
+    g_test_dir[sizeof(g_test_dir) - 1] = '\0';
     return 0;
+}
+
+/* Helper to write string content into a file inside g_test_dir */
+static int write_file(const char* rel_path, const char* content) {
+    char full[TEST_PATH_BUF_SIZE];
+    test_path(full, sizeof(full), rel_path);
+    FILE* f = fopen(full, "w");
+    if (!f) return -1;
+    if (content && fputs(content, f) < 0) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    return 0;
+}
+
+static int count_lines(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return -1;
+
+    int lines = 0;
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        if (c == '\n') lines++;
+    }
+
+    fclose(f);
+    return lines;
 }
 
 /* Test 1: Initialization and cleanup */
 static int test_init_destroy(void) {
-    cnotify_t* cn;
-
     TEST("init and destroy");
 
-    cn = cnotify_init();
+    cnotify_t* cn = cnotify_init();
     if (!cn) FAIL("cnotify_init failed");
 
     cnotify_destroy(cn);
-    cnotify_destroy(NULL); /* should be safe */
+    cnotify_destroy(NULL); /* Should be safe */
 
     PASS();
     return 0;
@@ -71,18 +124,14 @@ static int test_init_destroy(void) {
 
 /* Test 2: Add watch on valid directory */
 static int test_add_watch(void) {
-    cnotify_t* cn;
-    int ret;
-
     TEST("add watch on directory");
 
     if (setup_test_dir() < 0) FAIL("setup failed");
 
-    cn = cnotify_init();
+    cnotify_t* cn = cnotify_init();
     if (!cn) FAIL("init failed");
 
-    ret = cnotify_add_watch(cn, TEST_DIR, NULL);
-    if (ret < 0) {
+    if (cnotify_add_watch(cn, g_test_dir, NULL) < 0) {
         cnotify_destroy(cn);
         FAIL("add_watch failed");
     }
@@ -94,26 +143,22 @@ static int test_add_watch(void) {
 
 /* Test 3: Add watch with exclusions */
 static int test_exclusions(void) {
-    cnotify_t* cn;
-    int ret;
-    char exclude_path[256];
-    const char* exclude_list[] = {"excluded", NULL};
-
-    TEST("exclusion list");
+    TEST("exclusion list filtering");
 
     if (setup_test_dir() < 0) FAIL("setup failed");
 
-    /* Create subdirectories */
-    snprintf(exclude_path, sizeof(exclude_path), "%s/excluded", TEST_DIR);
-    mkdir(exclude_path, 0755);
-    snprintf(exclude_path, sizeof(exclude_path), "%s/included", TEST_DIR);
-    mkdir(exclude_path, 0755);
+    char path_buf[TEST_PATH_BUF_SIZE];
+    test_path(path_buf, sizeof(path_buf), "excluded");
+    mkdir(path_buf, 0755);
+    test_path(path_buf, sizeof(path_buf), "included");
+    mkdir(path_buf, 0755);
 
-    cn = cnotify_init();
+    const char* exclude_list[] = {"excluded", ".git", NULL};
+
+    cnotify_t* cn = cnotify_init();
     if (!cn) FAIL("init failed");
 
-    ret = cnotify_add_watch(cn, TEST_DIR, exclude_list);
-    if (ret < 0) {
+    if (cnotify_add_watch(cn, g_test_dir, exclude_list) < 0) {
         cnotify_destroy(cn);
         FAIL("add_watch with exclusions failed");
     }
@@ -123,22 +168,18 @@ static int test_exclusions(void) {
     return 0;
 }
 
-/* Test 4: Invalid path */
+/* Test 4: Invalid path error handling */
 static int test_invalid_path(void) {
-    cnotify_t* cn;
-    int ret;
+    TEST("invalid path error handling");
 
-    TEST("invalid path handling");
-
-    cn = cnotify_init();
+    cnotify_t* cn = cnotify_init();
     if (!cn) FAIL("init failed");
 
-    ret = cnotify_add_watch(cn, "/nonexistent/path", NULL);
+    int ret = cnotify_add_watch(cn, "/nonexistent/path/for/cnotify", NULL);
     if (ret == 0) {
         cnotify_destroy(cn);
         FAIL("should have failed on nonexistent path");
     }
-
     if (errno != ENOENT) {
         cnotify_destroy(cn);
         FAIL("wrong errno value");
@@ -151,11 +192,9 @@ static int test_invalid_path(void) {
 
 /* Test 5: Debounce setting */
 static int test_debounce(void) {
-    cnotify_t* cn;
-
     TEST("debounce configuration");
 
-    cn = cnotify_init();
+    cnotify_t* cn = cnotify_init();
     if (!cn) FAIL("init failed");
 
     cnotify_set_debounce(cn, 0);
@@ -169,18 +208,15 @@ static int test_debounce(void) {
 
 /* Test 6: Get file descriptor */
 static int test_get_fd(void) {
-    cnotify_t* cn;
-    int fd;
+    TEST("get inotify file descriptor");
 
-    TEST("get file descriptor");
-
-    cn = cnotify_init();
+    cnotify_t* cn = cnotify_init();
     if (!cn) FAIL("init failed");
 
-    fd = cnotify_get_fd(cn);
+    int fd = cnotify_get_fd(cn);
     if (fd < 0) {
         cnotify_destroy(cn);
-        FAIL("invalid fd");
+        FAIL("invalid fd returned");
     }
 
     cnotify_destroy(cn);
@@ -190,125 +226,288 @@ static int test_get_fd(void) {
 
 /* Test 7: Event type names */
 static int test_event_names(void) {
-    TEST("event type names");
+    TEST("event type string representations");
 
     if (strcmp(cnotify_event_type_name(CNOTIFY_EVENT_MODIFY), "MODIFY") != 0) FAIL("wrong name for MODIFY");
-
     if (strcmp(cnotify_event_type_name(CNOTIFY_EVENT_CREATE), "CREATE") != 0) FAIL("wrong name for CREATE");
-
     if (strcmp(cnotify_event_type_name(CNOTIFY_EVENT_DELETE), "DELETE") != 0) FAIL("wrong name for DELETE");
-
+    if (strcmp(cnotify_event_type_name(CNOTIFY_EVENT_MOVE), "MOVE") != 0) FAIL("wrong name for MOVE");
+    if (strcmp(cnotify_event_type_name(CNOTIFY_EVENT_ATTRIB), "ATTRIB") != 0) FAIL("wrong name for ATTRIB");
+    if (strcmp(cnotify_event_type_name(CNOTIFY_EVENT_CLOSE_WRITE), "CLOSE_WRITE") != 0)
+        FAIL("wrong name for CLOSE_WRITE");
     if (strcmp(cnotify_event_type_name((cnotify_event_type_t)999), "UNKNOWN") != 0) FAIL("wrong name for invalid type");
 
     PASS();
     return 0;
 }
 
-/* Test 8: Basic event detection */
-static volatile int event_received = 0;
+/* Test 8: Basic event loop detection */
+static volatile int g_event_received = 0;
 
-static int event_callback(const cnotify_event_t* event, void* userdata) {
+static int event_callback_stop(const cnotify_event_t* event, void* userdata) {
     (void)event;
     (void)userdata;
-    event_received = 1;
-    return 1; /* stop loop */
+    g_event_received = 1;
+    return 1; /* Non-zero stops loop */
 }
 
 static int test_event_detection(void) {
-    cnotify_t* cn;
-    pid_t pid;
-    int status;
-    char filepath[256];
-
-    TEST("basic event detection");
+    TEST("basic file creation event detection");
 
     if (setup_test_dir() < 0) FAIL("setup failed");
 
-    cn = cnotify_init();
+    cnotify_t* cn = cnotify_init();
     if (!cn) FAIL("init failed");
 
-    if (cnotify_add_watch(cn, TEST_DIR, NULL) < 0) {
+    if (cnotify_add_watch(cn, g_test_dir, NULL) < 0) {
         cnotify_destroy(cn);
         FAIL("add_watch failed");
     }
 
     cnotify_set_debounce(cn, 50);
 
-    /* Fork to create event while parent watches */
-    pid = fork();
+    pid_t pid = fork();
     if (pid < 0) {
         cnotify_destroy(cn);
         FAIL("fork failed");
     }
 
     if (pid == 0) {
-        /* Child: wait a bit then create a file */
         usleep(100000); /* 100ms */
-        snprintf(filepath, sizeof(filepath), "%s/testfile", TEST_DIR);
-        FILE* f = fopen(filepath, "w");
-        if (f) {
-            fprintf(f, "test\n");
-            fclose(f);
-        }
-        exit(0);
+        write_file("testfile.txt", "hello\n");
+        _exit(0);
     }
 
-    /* Parent: watch for events */
-    event_received = 0;
-    cnotify_start_loop(cn, event_callback, NULL);
+    g_event_received = 0;
+    cnotify_start_loop(cn, event_callback_stop, NULL);
 
+    int status;
     waitpid(pid, &status, 0);
     cnotify_destroy(cn);
 
-    if (!event_received) FAIL("no event received");
+    if (!g_event_received) FAIL("no event received");
 
     PASS();
     return 0;
 }
 
-/* Test 9: NULL parameter handling */
-static int test_null_params(void) {
-    TEST("NULL parameter handling");
+/* Test 9: Real-world recursive directory detection */
+static volatile int g_recursive_event_count = 0;
+static char g_last_event_path[TEST_PATH_BUF_SIZE] = {0};
 
-    cnotify_destroy(NULL);
-
-    if (cnotify_get_fd(NULL) != -1) FAIL("get_fd should return -1 for NULL");
-
-    cnotify_set_debounce(NULL, 100); /* should not crash */
-
-    cnotify_request_stop(NULL); /* should not crash */
-
-    PASS();
+static int recursive_event_cb(const cnotify_event_t* event, void* userdata) {
+    (void)userdata;
+    g_recursive_event_count++;
+    snprintf(g_last_event_path, sizeof(g_last_event_path), "%s/%s", event->path, event->name);
+    if (strstr(g_last_event_path, "deep_file.txt") != NULL) {
+        return 1; /* Stop loop on deep target file */
+    }
     return 0;
 }
 
-/* Test 10: Remove watch */
-static int test_remove_watch(void) {
-    cnotify_t* cn;
-    int ret;
-
-    TEST("remove watch");
+static int test_recursive_subdir_watch(void) {
+    TEST("dynamic subdirectory creation & recursive watch");
 
     if (setup_test_dir() < 0) FAIL("setup failed");
 
-    cn = cnotify_init();
+    cnotify_t* cn = cnotify_init();
     if (!cn) FAIL("init failed");
 
-    ret = cnotify_add_watch(cn, TEST_DIR, NULL);
-    if (ret < 0) {
+    if (cnotify_add_watch(cn, g_test_dir, NULL) < 0) {
         cnotify_destroy(cn);
         FAIL("add_watch failed");
     }
 
-    ret = cnotify_remove_watch(cn, TEST_DIR);
+    cnotify_set_debounce(cn, 20);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        cnotify_destroy(cn);
+        FAIL("fork failed");
+    }
+
+    if (pid == 0) {
+        usleep(100000);
+        char sub1[TEST_PATH_BUF_SIZE];
+        test_path(sub1, sizeof(sub1), "nested_dir");
+        mkdir(sub1, 0755);
+
+        usleep(100000); /* Allow inotify to process and watch new dir */
+        char deep_file[TEST_PATH_BUF_SIZE];
+        test_path(deep_file, sizeof(deep_file), "nested_dir/deep_file.txt");
+        FILE* f = fopen(deep_file, "w");
+        if (f) {
+            fprintf(f, "content\n");
+            fclose(f);
+        }
+        _exit(0);
+    }
+
+    g_recursive_event_count = 0;
+    g_last_event_path[0] = '\0';
+    cnotify_start_loop(cn, recursive_event_cb, NULL);
+
+    int status;
+    waitpid(pid, &status, 0);
+    cnotify_destroy(cn);
+
+    if (strstr(g_last_event_path, "deep_file.txt") == NULL) {
+        FAIL("did not receive event for file in dynamically created subdirectory");
+    }
+
+    PASS();
+    return 0;
+}
+
+/* Test 10: File content hashing and change detection logic */
+static int test_file_changed_cache(void) {
+    TEST("content hash change detection vs touched mtime");
+
+    if (setup_test_dir() < 0) FAIL("setup failed");
+
+    cnotify_t* cn = cnotify_init();
+    if (!cn) FAIL("init failed");
+
+    if (write_file("data.txt", "v1.0") < 0) {
+        cnotify_destroy(cn);
+        FAIL("write_file failed");
+    }
+
+    char target[TEST_PATH_BUF_SIZE];
+    test_path(target, sizeof(target), "data.txt");
+
+    /* Pre-seed by adding watch */
+    if (cnotify_add_watch(cn, g_test_dir, NULL) < 0) {
+        cnotify_destroy(cn);
+        FAIL("add_watch failed");
+    }
+
+    /* 1. First check right after seeding must return 0 (no changes) */
+    if (cnotify_file_changed(cn, target) != 0) {
+        cnotify_destroy(cn);
+        FAIL("unmodified file flagged as changed");
+    }
+
+    /* 2. Touch mtime without modifying contents -> should return 0 */
+    usleep(10000);
+    struct stat st;
+    stat(target, &st);
+    struct timespec times[2] = {{st.st_atime, 0}, {st.st_mtime + 5, 0}};
+    utimensat(AT_FDCWD, target, times, 0);
+
+    if (cnotify_file_changed(cn, target) != 0) {
+        cnotify_destroy(cn);
+        FAIL("touched mtime with identical content flagged as changed");
+    }
+
+    /* 3. Real content modification -> must return 1 */
+    write_file("data.txt", "v2.0 changed bytes");
+    if (cnotify_file_changed(cn, target) != 1) {
+        cnotify_destroy(cn);
+        FAIL("modified file content not detected as change");
+    }
+
+    /* 4. Subsequent check without changes -> returns 0 */
+    if (cnotify_file_changed(cn, target) != 0) {
+        cnotify_destroy(cn);
+        FAIL("cached file flagged as changed twice");
+    }
+
+    /* 5. Remove from cache */
+    if (cnotify_file_remove(cn, target) != 1) {
+        cnotify_destroy(cn);
+        FAIL("cnotify_file_remove failed to find existing record");
+    }
+
+    cnotify_destroy(cn);
+    PASS();
+    return 0;
+}
+
+int callback(const cnotify_event_t* ev, void* u) {
+    (void)ev;
+    (*(int*)u)++;
+    return 0;
+}
+
+/* Test 11: Non-blocking event drain */
+static int test_process_events_drain(void) {
+    TEST("non-blocking cnotify_process_events draining");
+
+    if (setup_test_dir() < 0) FAIL("setup failed");
+
+    cnotify_t* cn = cnotify_init();
+    if (!cn) FAIL("init failed");
+
+    if (cnotify_add_watch(cn, g_test_dir, NULL) < 0) {
+        cnotify_destroy(cn);
+        FAIL("add_watch failed");
+    }
+
+    /* Generate multiple events */
+    write_file("f1.txt", "1");
+    write_file("f2.txt", "2");
+    write_file("f3.txt", "3");
+
+    usleep(50000); /* Allow inotify queue to populate */
+
+    int drain_count = 0;
+    int ret = cnotify_process_events(cn, callback, &drain_count);
     if (ret < 0) {
+        cnotify_destroy(cn);
+        FAIL("cnotify_process_events failed");
+    }
+
+    if (drain_count < 3) {
+        cnotify_destroy(cn);
+        FAIL("failed to drain all pending events");
+    }
+
+    cnotify_destroy(cn);
+    PASS();
+    return 0;
+}
+
+/* Test 12: NULL parameter handling */
+static int test_null_params(void) {
+    TEST("NULL parameter safety");
+
+    cnotify_destroy(NULL);
+
+    if (cnotify_get_fd(NULL) != -1) FAIL("get_fd should return -1 for NULL");
+    if (cnotify_file_changed(NULL, "path") != 0) FAIL("file_changed should handle NULL context");
+    if (cnotify_file_changed((cnotify_t*)0x1, NULL) != 0) FAIL("file_changed should handle NULL path");
+    if (cnotify_file_remove(NULL, "path") != 0) FAIL("file_remove should handle NULL context");
+    if (cnotify_file_remove((cnotify_t*)0x1, NULL) != 0) FAIL("file_remove should handle NULL path");
+
+    cnotify_set_debounce(NULL, 100);
+    cnotify_request_stop(NULL);
+
+    PASS();
+    return 0;
+}
+
+/* Test 13: Remove watch */
+static int test_remove_watch(void) {
+    TEST("remove watch by path");
+
+    if (setup_test_dir() < 0) FAIL("setup failed");
+
+    cnotify_t* cn = cnotify_init();
+    if (!cn) FAIL("init failed");
+
+    if (cnotify_add_watch(cn, g_test_dir, NULL) < 0) {
+        cnotify_destroy(cn);
+        FAIL("add_watch failed");
+    }
+
+    if (cnotify_remove_watch(cn, g_test_dir) < 0) {
         cnotify_destroy(cn);
         FAIL("remove_watch failed");
     }
 
-    /* Removing again should fail */
-    ret = cnotify_remove_watch(cn, TEST_DIR);
-    if (ret == 0) {
+    /* Second remove on same path must return -1 (ENOENT) */
+    if (cnotify_remove_watch(cn, g_test_dir) == 0) {
         cnotify_destroy(cn);
         FAIL("remove_watch should fail on already removed path");
     }
@@ -318,67 +517,54 @@ static int test_remove_watch(void) {
     return 0;
 }
 
-/*
- * Test 11: cnotify_request_stop() unblocks cnotify_start_loop() promptly,
- * even with no filesystem activity and even from a signal handler.
- *
- * This exercises the self-pipe mechanism that replaced select()-based
- * EINTR timing: a SIGALRM fires after a short delay, its handler calls
- * cnotify_request_stop() (the only thing it does — no exit(), no printf()),
- * and the blocking loop must return 0 promptly rather than hanging forever
- * waiting on the inotify fd.
- */
+/* Test 14: Signal-safe stop request */
 static volatile sig_atomic_t g_stop_test_cn_valid = 0;
 static cnotify_t* g_stop_test_cn = NULL;
 
 static void stop_test_alarm_handler(int sig) {
     (void)sig;
-    if (g_stop_test_cn_valid) cnotify_request_stop(g_stop_test_cn);
+    if (g_stop_test_cn_valid && g_stop_test_cn) {
+        cnotify_request_stop(g_stop_test_cn);
+    }
 }
 
 static int never_called_callback(const cnotify_event_t* event, void* userdata) {
     (void)event;
     (void)userdata;
-    return 0; /* Should never actually be invoked in this test. */
+    return 0;
 }
 
 static int test_request_stop(void) {
-    cnotify_t* cn;
-    struct sigaction sa, old_sa;
-    int ret;
-
-    TEST("request_stop unblocks event loop");
+    TEST("request_stop unblocks blocking loop safely");
 
     if (setup_test_dir() < 0) FAIL("setup failed");
 
-    cn = cnotify_init();
+    cnotify_t* cn = cnotify_init();
     if (!cn) FAIL("init failed");
 
-    if (cnotify_add_watch(cn, TEST_DIR, NULL) < 0) {
+    if (cnotify_add_watch(cn, g_test_dir, NULL) < 0) {
         cnotify_destroy(cn);
         FAIL("add_watch failed");
     }
 
-    /* No filesystem events will occur; only the alarm-driven stop request
-     * should ever unblock the loop below. */
     cnotify_set_debounce(cn, 0);
 
     g_stop_test_cn = cn;
     g_stop_test_cn_valid = 1;
 
+    struct sigaction sa, old_sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = stop_test_alarm_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0; /* Deliberately no SA_RESTART: this also exercises the
-                      * EINTR-retry path in cnotify_start_loop()'s poll(). */
+    sa.sa_flags = 0;
     if (sigaction(SIGALRM, &sa, &old_sa) < 0) {
         cnotify_destroy(cn);
         FAIL("sigaction failed");
     }
 
-    alarm(1); /* fires in 1 second */
+    alarm(1);
 
-    ret = cnotify_start_loop(cn, never_called_callback, NULL);
+    int ret = cnotify_start_loop(cn, never_called_callback, NULL);
 
     alarm(0);
     sigaction(SIGALRM, &old_sa, NULL);
@@ -393,45 +579,21 @@ static int test_request_stop(void) {
     return 0;
 }
 
-static int count_lines(const char* path) {
-    FILE* f;
-    int lines = 0;
-    int c;
-
-    f = fopen(path, "r");
-    if (!f) return -1;
-
-    while ((c = fgetc(f)) != EOF) {
-        if (c == '\n') lines++;
-    }
-
-    fclose(f);
-    return lines;
-}
-
-/* Test 12: CLI integration - unchanged atomic save should not reload */
+/* Test 15: CLI integration - Unchanged atomic save (write tmp + rename) */
 static int test_cli_unchanged_atomic_save(void) {
-    char runner_path[256];
-    char runlog_path[256];
-    char watched_path[256];
-    char tmp_path[256];
-    FILE* f;
-    pid_t pid;
-    int status;
-    int lines_after_start;
-    int lines_after_unchanged;
-    int lines_after_change;
-
-    TEST("CLI unchanged atomic save integration");
+    TEST("CLI atomic save with identical content does not restart");
 
     if (setup_test_dir() < 0) FAIL("setup failed");
 
-    snprintf(runner_path, sizeof(runner_path), "%s/runner.sh", TEST_DIR);
-    snprintf(runlog_path, sizeof(runlog_path), "%s/run.log", TEST_DIR);
-    snprintf(watched_path, sizeof(watched_path), "%s/watched.txt", TEST_DIR);
-    snprintf(tmp_path, sizeof(tmp_path), "%s/watched.tmp", TEST_DIR);
+    char runner_path[TEST_PATH_BUF_SIZE], runlog_path[TEST_PATH_BUF_SIZE];
+    char watched_path[TEST_PATH_BUF_SIZE], tmp_path[TEST_PATH_BUF_SIZE];
 
-    f = fopen(runner_path, "w");
+    test_path(runner_path, sizeof(runner_path), "runner.sh");
+    test_path(runlog_path, sizeof(runlog_path), "run.log");
+    test_path(watched_path, sizeof(watched_path), "watched.txt");
+    test_path(tmp_path, sizeof(tmp_path), "watched.tmp");
+
+    FILE* f = fopen(runner_path, "w");
     if (!f) FAIL("failed to create runner script");
     fprintf(f, "#!/bin/sh\necho run >> \"$1\"\nsleep 60\n");
     fclose(f);
@@ -442,58 +604,60 @@ static int test_cli_unchanged_atomic_save(void) {
     fprintf(f, "hello\n");
     fclose(f);
 
-    pid = fork();
+    pid_t pid = fork();
     if (pid < 0) FAIL("fork failed");
 
     if (pid == 0) {
-        execl("./bin/cnotify", "./bin/cnotify", "-path", TEST_DIR, "-exclude",
-              ".git,.idea,.vscode,tmp,vendor,bin,run.log,runner.sh", "-bin",
-              "sh /tmp/cnotify_test/runner.sh /tmp/cnotify_test/run.log", (char*)NULL);
+        char bin_cmd[TEST_PATH_BUF_SIZE * 2 + 16];
+        snprintf(bin_cmd, sizeof(bin_cmd), "sh %s %s", runner_path, runlog_path);
+        execl("./bin/cnotify", "./bin/cnotify", "-path", g_test_dir, "-exclude",
+              ".git,.idea,.vscode,tmp,vendor,bin,run.log,runner.sh", "-bin", bin_cmd, (char*)NULL);
         _exit(127);
     }
 
     usleep(900000);
 
-    lines_after_start = count_lines(runlog_path);
+    int lines_after_start = count_lines(runlog_path);
     if (lines_after_start < 1) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
         FAIL("initial process did not start");
     }
 
-    /* Simulate atomic save with same content: write temp then rename over target. */
+    /* Simulate atomic rename with identical content */
     f = fopen(tmp_path, "w");
     if (!f) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
         FAIL("failed to create temp file");
     }
     fprintf(f, "hello\n");
     fclose(f);
+
     if (rename(tmp_path, watched_path) < 0) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
         FAIL("rename failed");
     }
 
     usleep(900000);
-    lines_after_unchanged = count_lines(runlog_path);
+    int lines_after_unchanged = count_lines(runlog_path);
 
-    /* Real content change should trigger one restart. */
+    /* Real content change should trigger a restart */
     f = fopen(watched_path, "w");
     if (!f) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
         FAIL("failed to modify watched file");
     }
     fprintf(f, "hello changed\n");
     fclose(f);
 
     usleep(1200000);
-    lines_after_change = count_lines(runlog_path);
+    int lines_after_change = count_lines(runlog_path);
 
     kill(pid, SIGTERM);
-    waitpid(pid, &status, 0);
+    waitpid(pid, NULL, 0);
 
     if (lines_after_unchanged != lines_after_start) FAIL("unchanged atomic save caused restart");
     if (lines_after_change <= lines_after_unchanged) FAIL("real content change did not restart");
@@ -502,177 +666,111 @@ static int test_cli_unchanged_atomic_save(void) {
     return 0;
 }
 
-/*
- * Test 13: CLI integration - SIGTERM triggers a clean shutdown that
- * actually kills the managed child process group.
- *
- * This is the end-to-end check that main.c's new shutdown path (signal
- * handler -> cnotify_request_stop() -> cnotify_start_loop() returns ->
- * main() runs kill_all_children()) really tears down the run_cmd process,
- * rather than relying on exit() firing from within the handler.
- */
+/* Test 16: CLI integration - Clean SIGTERM shutdown */
 static int test_cli_sigterm_shutdown(void) {
-    char watched_path[256];
-    pid_t pid;
-    int status;
-    FILE* f;
-
-    TEST("CLI SIGTERM clean shutdown");
+    TEST("CLI clean process termination on SIGTERM");
 
     if (setup_test_dir() < 0) FAIL("setup failed");
 
-    snprintf(watched_path, sizeof(watched_path), "%s/watched.txt", TEST_DIR);
-    f = fopen(watched_path, "w");
-    if (!f) FAIL("failed to create watched file");
-    fprintf(f, "hello\n");
-    fclose(f);
+    write_file("watched.txt", "hello\n");
 
-    pid = fork();
+    pid_t pid = fork();
     if (pid < 0) FAIL("fork failed");
 
     if (pid == 0) {
-        execl("./bin/cnotify", "./bin/cnotify", "-path", TEST_DIR, "-bin", "sleep 60", (char*)NULL);
+        execl("./bin/cnotify", "./bin/cnotify", "-path", g_test_dir, "-bin", "sleep 60", (char*)NULL);
         _exit(127);
     }
 
-    usleep(500000); /* let cnotify start and fork the "sleep 60" child */
+    usleep(500000);
 
     if (kill(pid, SIGTERM) < 0) {
         kill(pid, SIGKILL);
-        waitpid(pid, &status, 0);
+        waitpid(pid, NULL, 0);
         FAIL("failed to send SIGTERM");
     }
 
-    /* cnotify itself should exit promptly (well under the old TERM_TIMEOUT_MS
-     * ceiling plus scheduling slack) now that the handler no longer blocks
-     * on the previous select()/EINTR timing. */
+    int status;
     pid_t waited = waitpid(pid, &status, 0);
     if (waited != pid) FAIL("cnotify process did not exit after SIGTERM");
 
-    if (!WIFEXITED(status) && !WIFSIGNALED(status)) FAIL("unexpected exit status shape");
+    if (!WIFEXITED(status) && !WIFSIGNALED(status)) FAIL("unexpected exit status");
 
     PASS();
     return 0;
 }
 
-/*
- * Test 14: CLI integration - Custom exclude preserves default exclude list.
- *
- * Verifies that passing a custom -exclude value appends to, rather than
- * overwriting, the DEFAULT_EXCLUDE list. Changes inside .git (a default
- * exclude) and custom_excl (a user exclude) should both be ignored.
- */
+/* Test 17: CLI integration - Custom exclude retains default exclude list */
 static int test_cli_custom_exclude_keeps_defaults(void) {
-    char runner_path[256];
-    char runlog_path[256];
-    char git_dir[256];
-    char git_file[256];
-    char custom_dir[256];
-    char custom_file[256];
-    char watched_path[256];
-    FILE* f;
-    pid_t pid;
-    int status;
-    int lines_initial;
-    int lines_after_git;
-    int lines_after_custom;
-    int lines_after_watched;
-
-    TEST("CLI custom exclude retains default exclude list");
+    TEST("CLI custom exclude retains default excludes");
 
     if (setup_test_dir() < 0) FAIL("setup failed");
 
-    snprintf(runner_path, sizeof(runner_path), "%s/runner.sh", TEST_DIR);
-    snprintf(runlog_path, sizeof(runlog_path), "%s/run.log", TEST_DIR);
-    snprintf(git_dir, sizeof(git_dir), "%s/.git", TEST_DIR);
-    snprintf(git_file, sizeof(git_file), "%s/.git/config", TEST_DIR);
-    snprintf(custom_dir, sizeof(custom_dir), "%s/custom_excl", TEST_DIR);
-    snprintf(custom_file, sizeof(custom_file), "%s/custom_excl/file.txt", TEST_DIR);
-    snprintf(watched_path, sizeof(watched_path), "%s/watched.txt", TEST_DIR);
+    char runner_path[TEST_PATH_BUF_SIZE], runlog_path[TEST_PATH_BUF_SIZE];
+    char git_dir[TEST_PATH_BUF_SIZE], custom_dir[TEST_PATH_BUF_SIZE];
+
+    test_path(runner_path, sizeof(runner_path), "runner.sh");
+    test_path(runlog_path, sizeof(runlog_path), "run.log");
+    test_path(git_dir, sizeof(git_dir), ".git");
+    test_path(custom_dir, sizeof(custom_dir), "custom_excl");
 
     mkdir(git_dir, 0755);
     mkdir(custom_dir, 0755);
 
-    f = fopen(runner_path, "w");
+    FILE* f = fopen(runner_path, "w");
     if (!f) FAIL("failed to create runner script");
     fprintf(f, "#!/bin/sh\necho run >> \"$1\"\nsleep 60\n");
     fclose(f);
     chmod(runner_path, 0755);
 
-    f = fopen(watched_path, "w");
-    if (!f) FAIL("failed to create watched file");
-    fprintf(f, "initial\n");
-    fclose(f);
+    write_file("watched.txt", "initial\n");
 
-    pid = fork();
+    pid_t pid = fork();
     if (pid < 0) FAIL("fork failed");
 
     if (pid == 0) {
-        /* Only specify custom_excl, runner.sh, and run.log in -exclude. .git should still be excluded! */
-        execl("./bin/cnotify", "./bin/cnotify", "-path", TEST_DIR, "-exclude", "custom_excl,run.log,runner.sh", "-bin",
-              "sh /tmp/cnotify_test/runner.sh /tmp/cnotify_test/run.log", (char*)NULL);
+        char bin_cmd[TEST_PATH_BUF_SIZE * 2 + 16];
+        snprintf(bin_cmd, sizeof(bin_cmd), "sh %s %s", runner_path, runlog_path);
+        execl("./bin/cnotify", "./bin/cnotify", "-path", g_test_dir, "-exclude", "custom_excl,run.log,runner.sh",
+              "-bin", bin_cmd, (char*)NULL);
         _exit(127);
     }
 
     usleep(900000);
-    lines_initial = count_lines(runlog_path);
+    int lines_initial = count_lines(runlog_path);
     if (lines_initial < 1) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
         FAIL("initial process did not start");
     }
 
-    /* 1. Modify file inside .git (default exclude): should NOT trigger reload. */
-    f = fopen(git_file, "w");
-    if (!f) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
-        FAIL("failed to write git file");
-    }
-    fprintf(f, "git change\n");
-    fclose(f);
-
+    /* 1. Modify inside .git (default exclude) */
+    write_file(".git/config", "git change\n");
     usleep(900000);
-    lines_after_git = count_lines(runlog_path);
+    int lines_after_git = count_lines(runlog_path);
     if (lines_after_git != lines_initial) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
         FAIL("change in default exclude directory (.git) triggered reload");
     }
 
-    /* 2. Modify file inside custom_excl (user exclude): should NOT trigger reload. */
-    f = fopen(custom_file, "w");
-    if (!f) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
-        FAIL("failed to write custom exclude file");
-    }
-    fprintf(f, "custom exclude change\n");
-    fclose(f);
-
+    /* 2. Modify inside custom_excl */
+    write_file("custom_excl/file.txt", "custom change\n");
     usleep(900000);
-    lines_after_custom = count_lines(runlog_path);
+    int lines_after_custom = count_lines(runlog_path);
     if (lines_after_custom != lines_initial) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
         FAIL("change in user exclude directory triggered reload");
     }
 
-    /* 3. Modify normal watched file: SHOULD trigger reload. */
-    f = fopen(watched_path, "w");
-    if (!f) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
-        FAIL("failed to modify watched file");
-    }
-    fprintf(f, "updated content\n");
-    fclose(f);
-
+    /* 3. Modify normal watched file */
+    write_file("watched.txt", "updated content\n");
     usleep(1200000);
-    lines_after_watched = count_lines(runlog_path);
+    int lines_after_watched = count_lines(runlog_path);
 
     kill(pid, SIGTERM);
-    waitpid(pid, &status, 0);
+    waitpid(pid, NULL, 0);
 
     if (lines_after_watched <= lines_after_custom) FAIL("change in watched file did not trigger reload");
 
@@ -680,143 +778,77 @@ static int test_cli_custom_exclude_keeps_defaults(void) {
     return 0;
 }
 
-/*
- * Test 15: CLI integration - Ignore specific files and glob patterns.
- *
- * Verifies that exact path matching (static/css/styles.css) and glob patterns
- * (*_test.go, *.min.js) are ignored properly and do not trigger reloads.
- */
+/* Test 18: CLI integration - Ignore specific files and glob patterns */
 static int test_cli_ignore_files_and_patterns(void) {
-    char runner_path[256];
-    char runlog_path[256];
-    char static_dir[256];
-    char css_dir[256];
-    char css_file[256];
-    char test_file[256];
-    char minjs_file[256];
-    char watched_path[256];
-    FILE* f;
-    pid_t pid;
-    int status;
-    int lines_initial;
-    int lines_after_ignored;
-    int lines_after_watched;
-
-    TEST("CLI file and glob pattern ignore integration");
+    TEST("CLI exact files and glob pattern ignores");
 
     if (setup_test_dir() < 0) FAIL("setup failed");
 
-    snprintf(runner_path, sizeof(runner_path), "%s/runner.sh", TEST_DIR);
-    snprintf(runlog_path, sizeof(runlog_path), "%s/run.log", TEST_DIR);
-    snprintf(static_dir, sizeof(static_dir), "%s/static", TEST_DIR);
-    snprintf(css_dir, sizeof(css_dir), "%s/static/css", TEST_DIR);
-    snprintf(css_file, sizeof(css_file), "%s/static/css/styles.css", TEST_DIR);
-    snprintf(test_file, sizeof(test_file), "%s/main_test.go", TEST_DIR);
-    snprintf(minjs_file, sizeof(minjs_file), "%s/bundle.min.js", TEST_DIR);
-    snprintf(watched_path, sizeof(watched_path), "%s/main.go", TEST_DIR);
+    char runner_path[TEST_PATH_BUF_SIZE], runlog_path[TEST_PATH_BUF_SIZE], static_css_dir[TEST_PATH_BUF_SIZE];
+    test_path(runner_path, sizeof(runner_path), "runner.sh");
+    test_path(runlog_path, sizeof(runlog_path), "run.log");
+    test_path(static_css_dir, sizeof(static_css_dir), "static/css");
 
-    mkdir(static_dir, 0755);
-    mkdir(css_dir, 0755);
+    char cmd[TEST_PATH_BUF_SIZE + 16];
+    snprintf(cmd, sizeof(cmd), "mkdir -p \"%s\"", static_css_dir);
+    (void)system(cmd);
 
-    f = fopen(runner_path, "w");
+    FILE* f = fopen(runner_path, "w");
     if (!f) FAIL("failed to create runner script");
     fprintf(f, "#!/bin/sh\necho run >> \"$1\"\nsleep 60\n");
     fclose(f);
     chmod(runner_path, 0755);
 
-    f = fopen(css_file, "w");
-    if (!f) FAIL("failed to create css file");
-    fprintf(f, "body { color: red; }\n");
-    fclose(f);
+    write_file("static/css/styles.css", "body { color: red; }\n");
+    write_file("main_test.go", "package main\n");
+    write_file("bundle.min.js", "console.log(1);\n");
+    write_file("main.go", "package main\nfunc main() {}\n");
 
-    f = fopen(test_file, "w");
-    if (!f) FAIL("failed to create test file");
-    fprintf(f, "package main\n");
-    fclose(f);
-
-    f = fopen(minjs_file, "w");
-    if (!f) FAIL("failed to create min.js file");
-    fprintf(f, "console.log(1);\n");
-    fclose(f);
-
-    f = fopen(watched_path, "w");
-    if (!f) FAIL("failed to create watched file");
-    fprintf(f, "package main\nfunc main() {}\n");
-    fclose(f);
-
-    pid = fork();
+    pid_t pid = fork();
     if (pid < 0) FAIL("fork failed");
 
     if (pid == 0) {
-        execl("./bin/cnotify", "./bin/cnotify", "-path", TEST_DIR, "-exclude", "run.log,runner.sh", "-ignore",
-              "static/css/styles.css, *_test.go, *.min.js", "-bin",
-              "sh /tmp/cnotify_test/runner.sh /tmp/cnotify_test/run.log", (char*)NULL);
+        char bin_cmd[TEST_PATH_BUF_SIZE * 2 + 16];
+        snprintf(bin_cmd, sizeof(bin_cmd), "sh %s %s", runner_path, runlog_path);
+        execl("./bin/cnotify", "./bin/cnotify", "-path", g_test_dir, "-exclude", "run.log,runner.sh", "-ignore",
+              "static/css/styles.css, *_test.go, *.min.js", "-bin", bin_cmd, (char*)NULL);
         _exit(127);
     }
 
     usleep(900000);
-    lines_initial = count_lines(runlog_path);
+    int lines_initial = count_lines(runlog_path);
     if (lines_initial < 1) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
         FAIL("initial process did not start");
     }
 
-    /* 1. Modify exact ignored path: static/css/styles.css */
-    f = fopen(css_file, "w");
-    if (!f) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
-        FAIL("failed to modify css file");
-    }
-    fprintf(f, "body { color: blue; }\n");
-    fclose(f);
+    /* 1. Modify ignored exact path */
+    write_file("static/css/styles.css", "body { color: blue; }\n");
     usleep(600000);
 
-    /* 2. Modify glob pattern file: *_test.go */
-    f = fopen(test_file, "w");
-    if (!f) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
-        FAIL("failed to modify test file");
-    }
-    fprintf(f, "package main\n// new test\n");
-    fclose(f);
+    /* 2. Modify glob *_test.go */
+    write_file("main_test.go", "package main\n// updated\n");
     usleep(600000);
 
-    /* 3. Modify glob pattern file: *.min.js */
-    f = fopen(minjs_file, "w");
-    if (!f) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
-        FAIL("failed to modify minjs file");
-    }
-    fprintf(f, "console.log(2);\n");
-    fclose(f);
+    /* 3. Modify glob *.min.js */
+    write_file("bundle.min.js", "console.log(2);\n");
     usleep(600000);
 
-    lines_after_ignored = count_lines(runlog_path);
+    int lines_after_ignored = count_lines(runlog_path);
     if (lines_after_ignored != lines_initial) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
         FAIL("modifying ignored files/patterns caused reload");
     }
 
-    /* 4. Modify normal watched file: main.go */
-    f = fopen(watched_path, "w");
-    if (!f) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
-        FAIL("failed to modify watched file");
-    }
-    fprintf(f, "package main\nfunc main() { /* changed */ }\n");
-    fclose(f);
-
+    /* 4. Modify regular file */
+    write_file("main.go", "package main\nfunc main() { /* changed */ }\n");
     usleep(1200000);
-    lines_after_watched = count_lines(runlog_path);
+    int lines_after_watched = count_lines(runlog_path);
 
     kill(pid, SIGTERM);
-    waitpid(pid, &status, 0);
+    waitpid(pid, NULL, 0);
 
     if (lines_after_watched <= lines_after_ignored) FAIL("change in watched file did not trigger reload");
 
@@ -835,6 +867,9 @@ int main(void) {
     test_get_fd();
     test_event_names();
     test_event_detection();
+    test_recursive_subdir_watch();
+    test_file_changed_cache();
+    test_process_events_drain();
     test_null_params();
     test_remove_watch();
     test_request_stop();
@@ -847,8 +882,8 @@ int main(void) {
 
     printf("\n=== Results ===\n");
     printf("Total tests: %d\n", test_count);
-    printf("Passed: " ANSI_GREEN "%d" ANSI_RESET "\n", test_passed);
-    printf("Failed: " ANSI_RED "%d" ANSI_RESET "\n", test_count - test_passed);
+    printf("Passed:      " ANSI_GREEN "%d" ANSI_RESET "\n", test_passed);
+    printf("Failed:      " ANSI_RED "%d" ANSI_RESET "\n", test_count - test_passed);
 
     return (test_passed == test_count) ? 0 : 1;
 }
